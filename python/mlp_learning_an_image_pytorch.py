@@ -98,7 +98,7 @@ def get_args():
     )
 
     parser.add_argument(
-        "image", nargs="?", default="data/images/albert.jpg", help="Image to match"
+        "image", nargs="?", default="data/images/albert_cropped.jpg", help="Image to match"
     )
     parser.add_argument(
         "config",

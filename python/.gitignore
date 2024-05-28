@@ -1,4 +1,5 @@
 *.jpg
 !data/images/albert.jpg
+!data/images/albert_cropped.jpg
 
 tests/*.png

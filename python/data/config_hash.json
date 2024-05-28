@@ -14,7 +14,7 @@
         "otype": "Grid",
         "type": "Hash",
         "n_levels": 16,
-        "n_features_per_level": 2,
+        "n_features_per_level": 32,
         "log2_hashmap_size": 15,
         "base_resolution": 16,
         "per_level_scale": 1.5
