@@ -49,6 +49,8 @@ except ImportError:
     sys.exit()
 
 from common import read_image, write_image, ROOT_DIR
+from encoder import HashEmbedderNative
+from MLP_native import MLP_Native
 
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 IMAGES_DIR = os.path.join(DATA_DIR, "images")
@@ -127,8 +129,9 @@ if __name__ == "__main__":
     print("This script replicates the behavior of the native SYCL example  ")
     print("mlp_learning_an_image.cu using tiny-dpcpp-nn's PyTorch extension.")
     print("================================================================")
-
-    device = torch.device("xpu")
+    # device_name = "xpu"
+    device_name = "cpu"
+    device = torch.device(device_name)
     args = get_args()
 
     with open(args.config) as config_file:
@@ -149,16 +152,18 @@ if __name__ == "__main__":
     # tnn.Network when you don't want to combine them. Otherwise, use tnn.NetworkWithInputEncoding.
     # ===================================================================================================
 
-    encoding = tnn.Encoding(
-        n_input_dims=2,
-        encoding_config=config["encoding"],
-        dtype=torch.float,
-    )
-    network = tnn.Network(
-        n_input_dims=encoding.n_output_dims,
-        n_output_dims=n_channels,
-        network_config=config["network"],
-    )
+    # encoding = tnn.Encoding(
+    #     n_input_dims=2,
+    #     encoding_config=config["encoding"],
+    #     dtype=torch.float,
+    # )
+    encoding = HashEmbedderNative(n_pos_dims=2, encoding_config=config["encoding"])
+    # network = tnn.Network(
+    #     n_input_dims=encoding.n_output_dims,
+    #     n_output_dims=n_channels,
+    #     network_config=config["network"],
+    # )
+    network = MLP_Native(n_input_dims=encoding.n_output_dims, n_output_dims=n_channels, network_config=config["network"])
     model = torch.nn.Sequential(encoding, network).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -195,7 +200,7 @@ if __name__ == "__main__":
 
     for i in range(args.n_steps):
         batch = torch.rand([batch_size, 2], device=device, dtype=torch.float32).to(
-            "xpu"
+            device_name
         )
         targets = traced_image(batch)
         output = model(batch)
@@ -212,7 +217,7 @@ if __name__ == "__main__":
 
         if i % interval == 0:
             loss_val = loss.item()
-            torch.xpu.synchronize()
+            # torch.xpu.synchronize()
             elapsed_time = time.perf_counter() - prev_time
             print(f"Step#{i}: loss={loss_val} time={int(elapsed_time*1000000)}[µs]")
 
