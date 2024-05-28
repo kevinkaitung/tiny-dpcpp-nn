@@ -37,7 +37,9 @@ namespace kernels {
 template <typename T, uint32_t N_POS_DIMS, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
 void kernel_grid(const uint32_t num_elements, const uint32_t num_grid_features, const GridOffsetTable &offset_table,
                  const uint32_t base_resolution, const float log2_per_level_scale, float max_level,
+                 // My note: grid stores the hashtable values(?)
                  const InterpolationType interpolation_type, const GridType grid_type, T const *__restrict__ grid,
+                 // My note: positions_in stores the input coordinates; encoded_positions save the output vectors
                  const DeviceMatrixView<float> &positions_in, DeviceMatrixView<T> encoded_positions,
                  const sycl::nd_item<3> &item) {
     assert(grid != nullptr && "grid is nullptr, expected a valid pointer");
@@ -45,6 +47,9 @@ void kernel_grid(const uint32_t num_elements, const uint32_t num_grid_features, 
     const uint32_t i = item.get_global_id(2);
     if (i >= num_elements) return;
 
+    // My note: configuration of work item is (1, m_n_levels, batch_size) and
+    // configuration of work group is (1, 1, N_THREADS_HASHGRID=512),
+    // so item.get_group(1) gets the m th work group, which also means the m th level
     const uint32_t level = item.get_group(1); // <- the level is the same for all threads
 
     max_level = ((max_level * num_grid_features) / N_FEATURES_PER_LEVEL);
@@ -56,6 +61,7 @@ void kernel_grid(const uint32_t num_elements, const uint32_t num_grid_features, 
         return;
     }
 
+    // My note: query offset table to get the hash table size of each level
     grid += offset_table.data[level] * N_FEATURES_PER_LEVEL;
     const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
     const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
@@ -67,9 +73,13 @@ void kernel_grid(const uint32_t num_elements, const uint32_t num_grid_features, 
 
     if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
         for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+            // My note: to get the grid points(?) or process the input coordinates(? but why need to process with the grid value?),
+            // each dimension of input coordinates is multiplied with scale and add 0.5
             pos[dim] = sycl::fma(scale, positions_in(i, dim), 0.5f);
             const float tmp = sycl::floor(pos[dim]);
+            // My note: keep the integer part
             pos_grid[dim] = (uint32_t)(int)tmp;
+            // My note: keep the fraction part
             pos[dim] -= tmp;
             pos_derivative[dim] = identity_derivative(pos[dim]);
             pos[dim] = identity_fun(pos[dim]);
@@ -85,9 +95,12 @@ void kernel_grid(const uint32_t num_elements, const uint32_t num_grid_features, 
         }
     }
 
+    // My note: lambda function to get hash value of given coordinate
     auto grid_val = [&](const tnn::uvec<N_POS_DIMS> &local_pos) {
+        // My note: compute the hashed index of given coordinates
         const uint32_t index =
             grid_index<N_POS_DIMS, HASH_TYPE>(grid_type, hashmap_size, resolution, local_pos) * N_FEATURES_PER_LEVEL;
+        // My note: look up the hash table by hashed index
         return *(tnn::tvec<T, N_FEATURES_PER_LEVEL, sizeof(T) * N_FEATURES_PER_LEVEL> *)&grid[index];
     };
 
@@ -98,8 +111,12 @@ void kernel_grid(const uint32_t num_elements, const uint32_t num_grid_features, 
         }
     } else {
         // N-linear interpolation
+        // My note: this result is used to store the interpolated feature vector 
         tnn::tvec<T, N_FEATURES_PER_LEVEL, sizeof(T) * N_FEATURES_PER_LEVEL> result((T)0);
 
+        // My note: 1 << N_POS_DIMS (2^N_POS_DIMS) vertices to interpolate
+        // For example, if N_POS_DIMS = 2, 4 vertices to interpolate (square)
+        // if N_POS_DIMS = 3, 8 vertices to interpolate (cube)
         for (uint32_t idx = 0; idx < (1 << N_POS_DIMS); ++idx) {
             float weight = 1.0f;
             tnn::uvec<N_POS_DIMS> pos_grid_local;
@@ -117,6 +134,7 @@ void kernel_grid(const uint32_t num_elements, const uint32_t num_grid_features, 
             result = tnn::fma((T)weight, grid_val(pos_grid_local), result);
         }
 
+        // My note: copy result to output vectors
         for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
             encoded_positions(i, level * N_FEATURES_PER_LEVEL + f) = result[f];
         }
@@ -134,6 +152,7 @@ void kernel_grid_backward(const size_t num_elements, const uint32_t num_grid_fea
     const size_t i = (item.get_global_id(2) * N_FEATURES_PER_THREAD) / N_FEATURES_PER_LEVEL;
     if (i >= num_elements) return;
 
+    // My note: item.get_group(1) gets the m th work group, which also means the m th level
     const uint32_t level = item.get_group(1); // <- the level is the same for all threads.
     const uint32_t feature = item.get_global_id(2) * N_FEATURES_PER_THREAD - i * N_FEATURES_PER_LEVEL;
 
@@ -141,11 +160,13 @@ void kernel_grid_backward(const size_t num_elements, const uint32_t num_grid_fea
 
     if (level >= max_level + 1e-3f) return;
 
+    // My note: query offset table to get the hash table size of each level
     grid_gradient += offset_table.data[level] * N_FEATURES_PER_LEVEL;
     const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
     const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
     const uint32_t resolution = grid_resolution(scale);
 
+    // My Note: lambda function to calculate the gradients based on the interpolation type and weights
     auto add_grid_gradient = [&](const tnn::uvec<N_POS_DIMS> &local_pos,
                                  const tnn::tvec<GRAD_T, N_FEATURES_PER_THREAD> &grad, const float weight) {
         const uint32_t index =
@@ -153,6 +174,9 @@ void kernel_grid_backward(const size_t num_elements, const uint32_t num_grid_fea
             feature;
 
         for (size_t i = 0; i < N_FEATURES_PER_THREAD; ++i) {
+            // My Note: using atomic_ref to guarantee: when doing some operation such as addition,
+            // the data (grid_gradient in this case) would not be access by multiple threads or work-items,
+            // so there would not be the race condition on it
             sycl::atomic_ref<GRAD_T, sycl::memory_order::relaxed, sycl::memory_scope::device,
                              sycl::access::address_space::global_space>
                 atomic_op(grid_gradient[index + i]);
@@ -899,6 +923,7 @@ class GridEncodingTemplated : public GridEncoding<T> {
 
 template <typename T, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
 std::shared_ptr<GridEncoding<T>> create_grid_encoding_templated_2(const json &encoding) {
+    // My note: read configuration parameters from json file
     const uint32_t log2_hashmap_size = encoding.value(EncodingParams::LOG2_HASHMAP_SIZE, 19u);
     const uint32_t n_dims_to_encode = encoding.value(EncodingParams::N_DIMS_TO_ENCODE, 2u);
 

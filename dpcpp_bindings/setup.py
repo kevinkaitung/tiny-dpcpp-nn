@@ -55,6 +55,7 @@ class CMakeBuild(build_ext):
             "-D BUILD_TEST=OFF",
             "-D BUILD_BENCHMARK=OFF",
             "-D BUILD_PYBIND=ON",
+            "-D TARGET_DEVICE=ARC",
         ]
         build_args = []
         # Adding CMake arguments set as environment variable

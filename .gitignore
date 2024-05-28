@@ -47,3 +47,5 @@ extern/libtorch
 # results
 benchmarks/results
 
+# others
+genxir
