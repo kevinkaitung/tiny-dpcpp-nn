@@ -3,3 +3,6 @@
 !data/images/albert_cropped.jpg
 
 tests/*.png
+
+*.raw
+!data/images/bonsai.raw

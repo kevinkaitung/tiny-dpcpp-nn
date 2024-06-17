@@ -175,3 +175,32 @@ def compute_error(metric, img, ref):
         metric_map = np.mean(metric_map, axis=2)
     mean = np.mean(metric_map)
     return mean
+
+def read_volume(file, shape, dtype=np.uint8):
+    """
+    Reads volume data from a .raw file.
+
+    Args:
+        file (str): Path to the .raw file.
+        shape (tuple): Shape of the volume (depth, height, width).
+        dtype (data-type): Desired data-type for the array.
+
+    Returns:
+        numpy.ndarray: The volume data.
+    """
+    with open(file, "rb") as f:
+        volume = np.frombuffer(f.read(), dtype=dtype)
+        # cast volume data into float32 and reshape
+        volume = volume.astype(np.float32).reshape(shape)
+    return volume
+
+def write_volume(file, volume, dtype=np.uint8):
+    if os.path.splitext(file)[1] == ".raw":
+        # with open(file, "wb") as f:
+            # Write dimensions (depth, height, width)
+            # f.write(struct.pack("iii", volume.shape[0], volume.shape[1], volume.shape[2]))
+            # Write the data
+        converted_volume = volume.astype(dtype)
+        converted_volume.tofile(file)
+    else:
+        raise ValueError("Unsupported file extension. Only .raw files are supported.")
