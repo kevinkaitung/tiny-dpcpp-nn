@@ -169,18 +169,18 @@ if __name__ == "__main__":
     # tnn.Network when you don't want to combine them. Otherwise, use tnn.NetworkWithInputEncoding.
     # ===================================================================================================
 
-    encoding = tnn.Encoding(
-        n_input_dims=3,
-        encoding_config=config["encoding"],
-        dtype=torch.float,
-    )
-    # encoding = HashEmbedderNative(n_pos_dims=2, encoding_config=config["encoding"])
-    network = tnn.Network(
-        n_input_dims=encoding.n_output_dims,
-        n_output_dims=n_channels,
-        network_config=config["network"],
-    )
-    # network = MLP_Native(n_input_dims=encoding.n_output_dims, n_output_dims=n_channels, network_config=config["network"])
+    # encoding = tnn.Encoding(
+    #     n_input_dims=3,
+    #     encoding_config=config["encoding"],
+    #     dtype=torch.float,
+    # )
+    encoding = HashEmbedderNative(n_pos_dims=3, encoding_config=config["encoding"])
+    # network = tnn.Network(
+    #     n_input_dims=encoding.n_output_dims,
+    #     n_output_dims=n_channels,
+    #     network_config=config["network"],
+    # )
+    network = MLP_Native(n_input_dims=encoding.n_output_dims, n_output_dims=n_channels, network_config=config["network"])
     model = torch.nn.Sequential(encoding, network).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -257,12 +257,29 @@ if __name__ == "__main__":
             path = f"{i}.raw"
             print(f"Writing '{path}'... ", end="")
                         
-            with torch.no_grad():
-                write_volume(
-                    path, 
-                    model(xyz).reshape(img_shape).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
-                    dtype=args.data_type
-                )
+            # Generate coordinates of regular gird on yz slices
+            # x = torch.arange(args.dims[0]).to("xpu")
+            for x in range(resolution[0]):
+                x_coord = torch.full((resolution[1] * resolution[2], 1), x, device=device, dtype=torch.float32) / (resolution[0] - 1)
+                y = torch.arange(resolution[1], device=device, dtype=torch.float32) / (resolution[1] - 1)
+                z = torch.arange(resolution[2], device=device, dtype=torch.float32) / (resolution[2] - 1)
+
+                # Create the grid using meshgrid
+                yv, zv = torch.meshgrid([y, z])
+
+                # Stack the coordinates along the last dimension and reshape
+                # xv, yv, zv / xv, zv, yv / yv, xv, zv / yv, zv, xv / zv, xv, yv / zv, yv, xv
+                yz = torch.stack((yv.flatten(), zv.flatten())).t()
+                xyz = torch.cat((x_coord, yz), dim=1)
+                    
+                with torch.no_grad():
+                    write_volume(
+                        path, 
+                        model(xyz).reshape([resolution[1], resolution[2]]).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
+                        dtype=args.data_type,
+                        # calculate offset by the number of elements in yz plane with 1 bytes of uint8
+                        offset= x * resolution[1] * resolution[2] * 1
+                    )
             print("done.")
 
             # Ignore the time spent saving the image
@@ -273,10 +290,27 @@ if __name__ == "__main__":
         # print("==================================================")
     if args.result_filename:
         print(f"Writing '{args.result_filename}'... ", end="")
-        with torch.no_grad():
-            write_volume(
-                args.result_filename,
-                model(xyz).reshape(img_shape).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
-                dtype=args.data_type
-            )
+        # Generate coordinates of regular gird on yz slices
+        # x = torch.arange(args.dims[0]).to("xpu")
+        for x in range(resolution[0]):
+            x_coord = torch.full((resolution[1] * resolution[2], 1), x, device=device, dtype=torch.float32) / (resolution[0] - 1)
+            y = torch.arange(resolution[1], device=device, dtype=torch.float32) / (resolution[1] - 1)
+            z = torch.arange(resolution[2], device=device, dtype=torch.float32) / (resolution[2] - 1)
+
+            # Create the grid using meshgrid
+            yv, zv = torch.meshgrid([y, z])
+
+            # Stack the coordinates along the last dimension and reshape
+            # xv, yv, zv / xv, zv, yv / yv, xv, zv / yv, zv, xv / zv, xv, yv / zv, yv, xv
+            yz = torch.stack((yv.flatten(), zv.flatten())).t()
+            xyz = torch.cat((x_coord, yz), dim=1)
+                
+            with torch.no_grad():
+                write_volume(
+                    args.result_filename,
+                    model(xyz).reshape([resolution[1], resolution[2]]).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
+                    dtype=args.data_type,
+                    # calculate offset by the number of elements in yz plane with 1 bytes of uint8
+                    offset= x * resolution[1] * resolution[2] * 1
+                )
         print("done.")

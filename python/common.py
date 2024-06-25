@@ -193,14 +193,10 @@ def read_volume(file, shape, dtype=np.uint8):
         # cast volume data into float32 and reshape
         volume = volume.astype(np.float32).reshape(shape)
     return volume
-
-def write_volume(file, volume, dtype=np.uint8):
-    if os.path.splitext(file)[1] == ".raw":
-        # with open(file, "wb") as f:
-            # Write dimensions (depth, height, width)
-            # f.write(struct.pack("iii", volume.shape[0], volume.shape[1], volume.shape[2]))
-            # Write the data
+   
+def write_volume(file, volume, dtype=np.uint8, offset=0):
+    mode = 'wb' if offset == 0 else 'r+b'
+    with open(file, mode) as f:
+        f.seek(offset)
         converted_volume = volume.astype(dtype)
-        converted_volume.tofile(file)
-    else:
-        raise ValueError("Unsupported file extension. Only .raw files are supported.")
+        converted_volume.tofile(f)

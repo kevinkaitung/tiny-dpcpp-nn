@@ -45,9 +45,9 @@ class HashEmbedderNative(nn.Module):
         self.base_resolution = encoding_config["base_resolution"]
         self.per_level_scale = encoding_config["per_level_scale"]
 
-        # self.n_output_dims = self.n_levels * self.n_features_per_level
+        self.n_output_dims = self.n_levels * self.n_features_per_level
         # instead concatenate feature vectors, try to multiply them 
-        self.n_output_dims = self.n_features_per_level
+        # self.n_output_dims = self.n_features_per_level
 
         embedding_offsets = []
         embedding_lengths = []
@@ -223,7 +223,7 @@ class HashEmbedderNative(nn.Module):
         # shape of out: [Batch size, 16, 2]
         out = (weights_arr.unsqueeze(-1) * embeds_arr).sum(dim=-2)
         # instead concatenate feature vectors, try to multiply them 
-        out = out.prod(dim=-2)
+        # out = out.prod(dim=-2)
         return out.reshape(-1, self.n_output_dims)
 
     def extra_repr(self):
