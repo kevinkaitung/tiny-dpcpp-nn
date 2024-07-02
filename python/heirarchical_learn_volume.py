@@ -36,6 +36,9 @@ import torch
 import intel_extension_for_pytorch
 import time
 import torch.nn as nn
+from torch.func import stack_module_state, functional_call
+from torch import vmap
+import copy
 
 try:
     import tiny_dpcpp_nn as tnn
@@ -140,8 +143,44 @@ def get_args():
     args = parser.parse_args()
     return args
 
+def generate_batch_samples(batch_size: int, partition_size: int, n_pos_dims: int, device=torch.device("cpu")):
+    # only support 3 dimensional inputs now
+    assert (n_pos_dims == 3)
+    mini_batch_size = int(batch_size / (partition_size ** n_pos_dims))
+    interval_along_one_dim = 1.0 / partition_size
+    mini_batches = []
+    # generate batches of samples for different encoders
+    for i in range(partition_size):
+        for j in range(partition_size):
+            for k in range(partition_size):
+                # shape: [mini_batch_size, 3] = [mini_batch_size, 3] * [3] + [3] (broadcasting)
+                mini_batch = torch.rand([mini_batch_size, 3], device=device, dtype=torch.float32) * torch.tensor(
+                    [interval_along_one_dim, interval_along_one_dim, interval_along_one_dim], device=device) + torch.tensor([
+                        interval_along_one_dim * i, interval_along_one_dim * j, interval_along_one_dim * k], device=device)
+                mini_batches.append(mini_batch)
+    mini_batches = torch.stack(mini_batches, dim=0)
+    return mini_batches
+    
+def model_inference_only(coords: torch.tensor, n_pos_dims: int, partition_size: int, encodings: any, network: any):
+    coords = coords.contiguous().to(torch.float32)
+    
+    enc_idx = coords * torch.tensor([partition_size, partition_size, partition_size], device=coords.device).float()
+    enc_idx = enc_idx.long()
+    # TODO: this part should revise for 2D image
+    x_idx = enc_idx[:,0].clamp(min=0, max=partition_size - 1)
+    y_idx = enc_idx[:,1].clamp(min=0, max=partition_size - 1)
+    z_idx = enc_idx[:,2].clamp(min=0, max=partition_size - 1)
+    flat_idx = x_idx * partition_size ** 2 + y_idx * partition_size + z_idx
+    
+    encoded_results = torch.zeros(coords.shape[0], encodings[0].n_output_dims, device=coords.device).float()
 
-if __name__ == "__main__":
+    for i in range(partition_size ** n_pos_dims):
+        group_idx = torch.nonzero(flat_idx == i).squeeze()
+        encoded_results[group_idx] = encodings[i](coords[group_idx])
+    
+    return network(encoded_results)
+    
+def main():
     print("================================================================")
     print("This script replicates the behavior of the native SYCL example  ")
     print("mlp_learning_an_image.cu using tiny-dpcpp-nn's PyTorch extension.")
@@ -170,21 +209,34 @@ if __name__ == "__main__":
     # tnn.Network when you don't want to combine them. Otherwise, use tnn.NetworkWithInputEncoding.
     # ===================================================================================================
 
+    partition_size = 3
+    n_pos_dims = 3
     # encoding = tnn.Encoding(
     #     n_input_dims=3,
     #     encoding_config=config["encoding"],
     #     dtype=torch.float,
     # )
-    encoding = HeirarchicalHashEmbedderNative(n_pos_dims=3, partition_size=2, individual_encoding_config=config["encoding"])
+    # encoding = HeirarchicalHashEmbedderNative(n_pos_dims=3, partition_size=2, individual_encoding_config=config["encoding"])
+    encodings = nn.ModuleList([HashEmbedderNative(n_pos_dims=n_pos_dims, encoding_config=config["encoding"]).to(device)
+                                            for _ in range(partition_size ** n_pos_dims)])
     # network = tnn.Network(
     #     n_input_dims=encoding.n_output_dims,
     #     n_output_dims=n_channels,
     #     network_config=config["network"],
     # )
-    network = MLP_Native(n_input_dims=encoding.n_output_dims, n_output_dims=n_channels, network_config=config["network"])
-    model = torch.nn.Sequential(encoding, network).to(device)
+    network = MLP_Native(n_input_dims=encodings[0].n_output_dims, n_output_dims=n_channels, network_config=config["network"]).to(device)
+    # models = nn.ModuleList([torch.nn.Sequential(encoding, network).to(device) for encoding in encodings])
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+    # version with using vmap
+    params, buffers = stack_module_state(encodings)
+    base_model = copy.deepcopy(encodings[0])
+    base_model = base_model.to('meta')
+    def fmodel(params, buffers, x):
+        return functional_call(base_model, (params, buffers), (x,))
+    # enc_optimizer = torch.optim.Adam(params.values(), lr=1e-3)
+    
+    enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
+    net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
 
     # Variables for saving/displaying image results
     resolution = image.data.shape[0:3]
@@ -231,11 +283,21 @@ if __name__ == "__main__":
         traced_image = image
 
     for i in range(args.n_steps):
-        batch = torch.rand([batch_size, 3], device=device, dtype=torch.float32).to(
-            device_name
-        )
-        targets = traced_image(batch)
-        output = model(batch)
+        mini_batches = generate_batch_samples(batch_size=batch_size, partition_size=partition_size, n_pos_dims=n_pos_dims, device=device)
+        targets = traced_image(mini_batches.view(-1, 3))
+        
+        # version with using vmap
+        # shape of enc_output is [number of encoders, mini batch size, number of feature vec dims]
+        # enc_output = vmap(fmodel)(params, buffers, mini_batches)
+        # enc_output = enc_output.view(-1, encodings[0].n_output_dims)
+        
+        # version without using vmap
+        enc_output = []
+        for mini_batch, encoding in zip(mini_batches ,encodings):
+            enc_output.append(encoding(mini_batch))
+        enc_output = torch.cat(enc_output, dim=0)
+        
+        output = network(enc_output)
 
         # adjust the output size to align with the target size
         output = output.view(-1)
@@ -245,9 +307,11 @@ if __name__ == "__main__":
 
         loss = relative_l2_error.mean()
 
-        optimizer.zero_grad()
+        enc_optimizer.zero_grad()
+        net_optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        net_optimizer.step()
+        enc_optimizer.step()
 
         if i % interval == 0:
             loss_val = loss.item()
@@ -276,7 +340,9 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     write_volume(
                         path, 
-                        model(xyz).reshape([resolution[1], resolution[2]]).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
+                        model_inference_only(coords=xyz, n_pos_dims=n_pos_dims, partition_size=partition_size, 
+                                             encodings=encodings, network=network).reshape([resolution[1], resolution[2]]
+                                            ).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
                         dtype=args.data_type,
                         # calculate offset by the number of elements in yz plane with 1 bytes of uint8
                         offset= x * resolution[1] * resolution[2] * 1
@@ -309,9 +375,14 @@ if __name__ == "__main__":
             with torch.no_grad():
                 write_volume(
                     args.result_filename,
-                    model(xyz).reshape([resolution[1], resolution[2]]).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
+                    model_inference_only(coords=xyz, n_pos_dims=n_pos_dims, partition_size=partition_size, 
+                                         encodings=encodings, network=network).reshape([resolution[1], resolution[2]]
+                                        ).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
                     dtype=args.data_type,
                     # calculate offset by the number of elements in yz plane with 1 bytes of uint8
                     offset= x * resolution[1] * resolution[2] * 1
                 )
         print("done.")
+
+if __name__ == "__main__":
+    main()

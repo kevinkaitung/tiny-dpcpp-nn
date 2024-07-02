@@ -143,14 +143,23 @@ class HashEmbedderNative(nn.Module):
         indices = torch.floor(positions).to(torch.int32) # shape => [B, 2] or [B, 3]
         positions = positions - indices # fractional part
         if self.n_pos_dims == 2:
-            offsets = coords.new_tensor([
+            # fix to support operation in vmap
+            offsets = torch.tensor([
                 [0,0],[0,1],[1,0],[1,1]
-            ], dtype=torch.int32) # shape => [4, 3]
+            ], device=coords.device, dtype=torch.int32)
+            # offsets = coords.new_tensor([
+            #     [0,0],[0,1],[1,0],[1,1]
+            # ], dtype=torch.int32) # shape => [4, 3]
         elif self.n_pos_dims == 3:
-            offsets = coords.new_tensor([
+            # fix to support operation in vmap
+            offsets = torch.tensor([
                 [0,0,0],[0,0,1],[0,1,0],[0,1,1],
                 [1,0,0],[1,0,1],[1,1,0],[1,1,1]
-            ], dtype=torch.int32) # shape => [8, 3]
+            ], device=coords.device, dtype=torch.int32)
+            # offsets = coords.new_tensor([
+            #     [0,0,0],[0,0,1],[0,1,0],[0,1,1],
+            #     [1,0,0],[1,0,1],[1,1,0],[1,1,1]
+            # ], dtype=torch.int32) # shape => [8, 3]
         # Calculate indices to store closest 4 or 8 grid points for this coordinates
         # shape for dim 2: [Batch size, 4, 2] = [Batch size, 1, 2] + [1, 4, 2]
         # shape for dim 3: [Batch size, 8, 3] = [Batch size, 1, 3] + [1, 8, 3]
