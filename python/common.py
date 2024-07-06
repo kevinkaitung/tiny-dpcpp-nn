@@ -176,20 +176,27 @@ def compute_error(metric, img, ref):
     mean = np.mean(metric_map)
     return mean
 
-def read_volume(file, shape, dtype=np.uint8):
+# only support reading the whole volume or sub-volume
+# whose data is layouted continuously
+# For example, if the original volume is (256, 256, 256),
+# reading sub-volume with (1, 256, 256) is valid,
+# reading sub-volume with (1, 128, 128) is not valid
+def read_volume(file, shape, dtype, offset=0):
     """
     Reads volume data from a .raw file.
 
     Args:
         file (str): Path to the .raw file.
-        shape (tuple): Shape of the volume (depth, height, width).
+        shape (tuple): Shape of the volume to read (depth, height, width).
         dtype (data-type): Desired data-type for the array.
-
+        offset (int): Number of elements to offset
     Returns:
         numpy.ndarray: The volume data.
     """
     with open(file, "rb") as f:
-        volume = np.frombuffer(f.read(), dtype=dtype)
+        f.seek(offset * np.dtype(dtype).itemsize)
+        # only read the chunk of the data assigned by the shape
+        volume = np.frombuffer(f.read(shape[0] * shape[1] * shape[2] * np.dtype(dtype).itemsize), dtype=dtype)
         # cast volume data into float32 and reshape
         volume = volume.astype(np.float32).reshape(shape)
     return volume
@@ -197,6 +204,6 @@ def read_volume(file, shape, dtype=np.uint8):
 def write_volume(file, volume, dtype=np.uint8, offset=0):
     mode = 'wb' if offset == 0 else 'r+b'
     with open(file, mode) as f:
-        f.seek(offset)
+        f.seek(offset * np.dtype(dtype).itemsize)
         converted_volume = volume.astype(dtype)
         converted_volume.tofile(f)

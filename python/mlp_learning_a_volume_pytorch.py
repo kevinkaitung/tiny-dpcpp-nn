@@ -277,8 +277,8 @@ if __name__ == "__main__":
                         path, 
                         model(xyz).reshape([resolution[1], resolution[2]]).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
                         dtype=args.data_type,
-                        # calculate offset by the number of elements in yz plane with 1 bytes of uint8
-                        offset= x * resolution[1] * resolution[2] * 1
+                        # calculate offset by the number of elements in yz plane
+                        offset= x * resolution[1] * resolution[2]
                     )
             print("done.")
 
@@ -310,7 +310,7 @@ if __name__ == "__main__":
                     args.result_filename,
                     model(xyz).reshape([resolution[1], resolution[2]]).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
                     dtype=args.data_type,
-                    # calculate offset by the number of elements in yz plane with 1 bytes of uint8
-                    offset= x * resolution[1] * resolution[2] * 1
+                    # calculate offset by the number of elements in yz plane
+                    offset= x * resolution[1] * resolution[2]
                 )
         print("done.")
