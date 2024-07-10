@@ -205,8 +205,7 @@ def main():
     #     return functional_call(base_model, (params, buffers), (x,))
     # enc_optimizer = torch.optim.Adam(params.values(), lr=1e-3)
     
-    enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
-    net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
 
     # Variables for saving/displaying image results
     resolution = args.dims
@@ -264,11 +263,9 @@ def main():
 
         loss = relative_l2_error.mean()
 
-        enc_optimizer.zero_grad()
-        net_optimizer.zero_grad()
+        optimizer.zero_grad()
         loss.backward()
-        net_optimizer.step()
-        enc_optimizer.step()
+        optimizer.step()
 
         if i % interval == 0:
             loss_val = loss.item()
