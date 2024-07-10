@@ -210,6 +210,8 @@ class HashEmbedderNative(nn.Module):
             for i in range(self.n_levels):
                 # shape of offsets: [Batch size, 4]
                 offsets, weights = self.access(coords, i)
+                # might need to offset hashed indices, so it can access the hashmap of its level
+                offsets += self.embedding_offsets[i]
                 # shape of offsets.unsqueeze(1): [Batch size, 1, 4(number of closest grid points)]
                 offsets_arr.append(offsets.unsqueeze(1))
                 weights_arr.append(weights.unsqueeze(1))

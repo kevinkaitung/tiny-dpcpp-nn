@@ -55,55 +55,10 @@ from common import read_image, write_image, ROOT_DIR, read_volume, write_volume
 from encoder import HashEmbedderNative
 from heirarchical_encoder import HeirarchicalHashEmbedderNative
 from MLP_native import MLP_Native
+import dvnr_sampler as spl
 
 DATA_DIR = os.path.join(ROOT_DIR, "data")
 IMAGES_DIR = os.path.join(DATA_DIR, "images")
-
-
-class Image(torch.nn.Module):
-    def __init__(self, filename, shape, dtype, device):
-        super(Image, self).__init__()
-        self.data = read_volume(filename, shape, dtype=dtype)
-        self.max_function_value = self.data.max()
-        self.data /= self.max_function_value
-        self.shape = self.data.shape
-        self.data = torch.from_numpy(self.data).float().to(device)
-
-    def forward(self, xs):
-        with torch.no_grad():
-            # Bilinearly filtered lookup from the image. Not super fast,
-            # but less than ~20% of the overall runtime of this example.
-            shape = self.shape
-
-            xs = xs * torch.tensor([shape[0] - 1, shape[1] - 1, shape[2] - 1], device=xs.device).float()
-            indices = xs.long()
-            lerp_weights = xs - indices.float()
-
-            x0 = indices[:, 0].clamp(min=0, max=shape[0] - 1)
-            y0 = indices[:, 1].clamp(min=0, max=shape[1] - 1)
-            z0 = indices[:, 2].clamp(min=0, max=shape[2] - 1)
-            x1 = (x0 + 1).clamp(max=shape[0] - 1)
-            y1 = (y0 + 1).clamp(max=shape[1] - 1)
-            z1 = (z0 + 1).clamp(max=shape[2] - 1)
-
-            c000 = self.data[x0, y0, z0]
-            c010 = self.data[x0, y1, z0]
-            c100 = self.data[x1, y0, z0]
-            c110 = self.data[x1, y1, z0]
-            c001 = self.data[x0, y0, z1]
-            c011 = self.data[x0, y1, z1]
-            c101 = self.data[x1, y0, z1]
-            c111 = self.data[x1, y1, z1]
-
-            # Trilinear interpolation
-            return ((1 - lerp_weights[:,0]) * (1 - lerp_weights[:,1]) * (1 - lerp_weights[:,2]) * c000
-                +   (1 - lerp_weights[:,0]) *      lerp_weights[:,1] *  (1 - lerp_weights[:,2]) * c010
-                +        lerp_weights[:,0] *  (1 - lerp_weights[:,1]) * (1 - lerp_weights[:,2]) * c100
-                +        lerp_weights[:,0] *       lerp_weights[:,1] *  (1 - lerp_weights[:,2]) * c110
-                +   (1 - lerp_weights[:,0]) * (1 - lerp_weights[:,1]) *      lerp_weights[:,2] * c001
-                +   (1 - lerp_weights[:,0]) *      lerp_weights[:,1] *       lerp_weights[:,2] * c011
-                +        lerp_weights[:,0] *  (1 - lerp_weights[:,1]) *      lerp_weights[:,2] * c101
-                +        lerp_weights[:,0] *       lerp_weights[:,1] *       lerp_weights[:,2] * c111)
 
 
 def get_args():
@@ -111,14 +66,22 @@ def get_args():
         description="Image benchmark using PyTorch bindings."
     )
 
+    # for dvnr volume sampler
     parser.add_argument(
-        "image", nargs="?", default="data/images/bonsai.raw", help="Image to match"
+        # '--filename', type=str, default="data/images/chameleon_1024x1024x1080_float32.raw", help="volume data file"
+        '--filename', type=str, default="data/images/bonsai.raw", help="volume data file"
     )
     parser.add_argument(
-        "shape", nargs="?", default=(256, 256, 256), help="Image Shape"
+        # "--dims", type=int, nargs=3, default=[1024, 1024, 1080], help="volume data dimensions"
+        "--dims", type=int, nargs=3, default=[256, 256, 256], help="volume data dimensions"
     )
     parser.add_argument(
-        "data_type", nargs="?", default=np.uint8, help="Image Data Type"
+        # "--type", type=str, default="float32", help="volume data type"
+        "--type", type=str, default="uint8", help="volume data type"
+    )
+    parser.add_argument(
+        # "--max_val", type=float, default=1.0, help="volume data maximum value"
+        "--max_val", type=float, default=255.0, help="volume data maximum value"
     )
     parser.add_argument(
         "config",
@@ -143,6 +106,13 @@ def get_args():
     args = parser.parse_args()
     return args
 
+def accumulate_squared_errors_of_slice(output, targets):
+    return ((output - targets) ** 2).sum()
+
+def calculate_PSNR_from_squared_errors_sum(squared_errors_sum, resolution):
+    temp = squared_errors_sum / (resolution[0] * resolution[1] * resolution[2])
+    return 20 * torch.log10(1.0 / torch.sqrt(torch.tensor(temp)))
+
 def generate_batch_samples(batch_size: int, partition_size: int, n_pos_dims: int, device=torch.device("cpu")):
     # only support 3 dimensional inputs now
     assert (n_pos_dims == 3)
@@ -159,23 +129,24 @@ def generate_batch_samples(batch_size: int, partition_size: int, n_pos_dims: int
                         interval_along_one_dim * i, interval_along_one_dim * j, interval_along_one_dim * k], device=device)
                 mini_batches.append(mini_batch)
     mini_batches = torch.stack(mini_batches, dim=0)
-    return mini_batches
-    
-def model_inference_only(coords: torch.tensor, n_pos_dims: int, partition_size: int, encodings: any, network: any):
+    return mini_batches, mini_batch_size
+
+def get_batch_encoder_idx(coords: torch.tensor, partition_size: int):
     coords = coords.contiguous().to(torch.float32)
     
     enc_idx = coords * torch.tensor([partition_size, partition_size, partition_size], device=coords.device).float()
     enc_idx = enc_idx.long()
-    # TODO: this part should revise for 2D image
     x_idx = enc_idx[:,0].clamp(min=0, max=partition_size - 1)
     y_idx = enc_idx[:,1].clamp(min=0, max=partition_size - 1)
     z_idx = enc_idx[:,2].clamp(min=0, max=partition_size - 1)
-    flat_idx = x_idx * partition_size ** 2 + y_idx * partition_size + z_idx
+    flat_idx = x_idx + y_idx * partition_size + z_idx * partition_size ** 2 
+    return flat_idx
     
+def model_inference(coords: torch.tensor, enc_idx: torch.tensor, n_pos_dims: int, partition_size: int, encodings: any, network: any):
     encoded_results = torch.zeros(coords.shape[0], encodings[0].n_output_dims, device=coords.device).float()
 
     for i in range(partition_size ** n_pos_dims):
-        group_idx = torch.nonzero(flat_idx == i).squeeze()
+        group_idx = torch.nonzero(enc_idx == i).squeeze()
         encoded_results[group_idx] = encodings[i](coords[group_idx])
     
     return network(encoded_results)
@@ -193,9 +164,8 @@ def main():
     with open(args.config) as config_file:
         config = json.load(config_file)
 
-    image = Image(args.image, args.shape, args.data_type, device)
-    # n_channels = image.data.shape[3]
     n_channels = 1
+    sampler = spl.create_sampler("structuredRegular", "openvkl", filename=args.filename, dims=args.dims, dtype=args.type, n_channels=n_channels)
 
     # model = tnn.NetworkWithInputEncoding(
     #     n_input_dims=3,
@@ -209,7 +179,7 @@ def main():
     # tnn.Network when you don't want to combine them. Otherwise, use tnn.NetworkWithInputEncoding.
     # ===================================================================================================
 
-    partition_size = 3
+    partition_size = 2
     n_pos_dims = 3
     # encoding = tnn.Encoding(
     #     n_input_dims=3,
@@ -228,63 +198,47 @@ def main():
     # models = nn.ModuleList([torch.nn.Sequential(encoding, network).to(device) for encoding in encodings])
 
     # version with using vmap
-    params, buffers = stack_module_state(encodings)
-    base_model = copy.deepcopy(encodings[0])
-    base_model = base_model.to('meta')
-    def fmodel(params, buffers, x):
-        return functional_call(base_model, (params, buffers), (x,))
+    # params, buffers = stack_module_state(encodings)
+    # base_model = copy.deepcopy(encodings[0])
+    # base_model = base_model.to('meta')
+    # def fmodel(params, buffers, x):
+    #     return functional_call(base_model, (params, buffers), (x,))
     # enc_optimizer = torch.optim.Adam(params.values(), lr=1e-3)
     
     enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
     net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
 
     # Variables for saving/displaying image results
-    resolution = image.data.shape[0:3]
-    img_shape = resolution
-    n_pixels = resolution[0] * resolution[1] * resolution[2]
-
-    half_dx = 0.5 / resolution[0]
-    half_dy = 0.5 / resolution[1]
-    half_dz = 0.5 / resolution[2]
-    xs = torch.linspace(half_dx, 1 - half_dx, resolution[0], device=device)
-    ys = torch.linspace(half_dy, 1 - half_dy, resolution[1], device=device)
-    zs = torch.linspace(half_dz, 1 - half_dz, resolution[2], device=device)
-    xv, yv, zv = torch.meshgrid([xs, ys, zs])
-
-    xyz = torch.stack((xv.flatten() ,yv.flatten(), zv.flatten())).t()
+    resolution = args.dims
     
     # # Generate coordinates of regular grid
-    # x = torch.arange(256).to("xpu")
-    # y = torch.arange(256).to("xpu")
-    # z = torch.arange(256).to("xpu")
+    # x = torch.arange(resolution[0], dtype=torch.float32, device=device) / (resolution[0] - 1)
+    # y = torch.arange(resolution[1], dtype=torch.float32, device=device) / (resolution[1] - 1)
+    # z = torch.arange(resolution[2], dtype=torch.float32, device=device) / (resolution[2] - 1)
 
     # # Create the grid using meshgrid
-    # xv, yv, zv = torch.meshgrid([x, y, z])
+    # zv, yv, xv = torch.meshgrid([z, y, x])
 
     # # Stack the coordinates along the last dimension and reshape
-    # # xv, yv, zv / xv, zv, yv / yv, xv, zv / yv, zv, xv / zv, xv, yv / zv, yv, xv
-    # xyz = torch.stack((xv.flatten() ,yv.flatten(), zv.flatten())).t()
-    # xyz = xyz.float() / 255.0
+    # zyx = torch.stack((zv.flatten() ,yv.flatten(), xv.flatten())).t()
+    # xyz = zyx[:, [2, 1, 0]]
+    # # print(zyx)
+    
     prev_time = time.perf_counter()
 
-    batch_size = 2**14
+    batch_size = 2**16
     interval = 10
 
     print(f"Beginning optimization with {args.n_steps} training steps.")
 
-    try:
-        batch = torch.rand([batch_size, 3], device=device, dtype=torch.float32)
-        traced_image = torch.jit.trace(image, batch)
-    except:
-        # If tracing causes an error, fall back to regular execution
-        print(
-            f"WARNING: PyTorch JIT trace failed. Performance will be slightly worse than regular."
-        )
-        traced_image = image
 
     for i in range(args.n_steps):
-        mini_batches = generate_batch_samples(batch_size=batch_size, partition_size=partition_size, n_pos_dims=n_pos_dims, device=device)
-        targets = traced_image(mini_batches.view(-1, 3))
+        # mini_batches, mini_batch_size = generate_batch_samples(batch_size=batch_size, partition_size=partition_size, n_pos_dims=n_pos_dims, device=device)
+        # targets = traced_image(mini_batches.view(-1, 3))
+        
+        coords, targets = spl.sample(sampler, batch_size)
+        coords = coords.to(device_name)
+        targets = targets.to(device_name)
         
         # version with using vmap
         # shape of enc_output is [number of encoders, mini batch size, number of feature vec dims]
@@ -292,15 +246,18 @@ def main():
         # enc_output = enc_output.view(-1, encodings[0].n_output_dims)
         
         # version without using vmap
-        enc_output = []
-        for mini_batch, encoding in zip(mini_batches ,encodings):
-            enc_output.append(encoding(mini_batch))
-        enc_output = torch.cat(enc_output, dim=0)
+        # enc_output = []
+        # for mini_batch, encoding in zip(mini_batches ,encodings):
+        #     enc_output.append(encoding(mini_batch))
+        # enc_output = torch.cat(enc_output, dim=0)
         
-        output = network(enc_output)
+        # output = network(enc_output)
 
+        # version complying with the coordinates generated by dvnr sampler
+        enc_idx = get_batch_encoder_idx(coords=coords, partition_size=partition_size)
+        output = model_inference(coords=coords, enc_idx=enc_idx, n_pos_dims=n_pos_dims, partition_size=partition_size, encodings=encodings, network=network)
         # adjust the output size to align with the target size
-        output = output.view(-1)
+        # output = output.view(-1)
         relative_l2_error = (output - targets.to(output.dtype)) ** 2 / (
             output.detach() ** 2 + 0.01
         )
@@ -322,67 +279,114 @@ def main():
             path = f"{i}.raw"
             print(f"Writing '{path}'... ", end="")
                         
+            squared_errors_sum = 0
             # Generate coordinates of regular gird on yz slices
-            # x = torch.arange(args.dims[0]).to("xpu")
-            for x in range(resolution[0]):
-                x_coord = torch.full((resolution[1] * resolution[2], 1), x, device=device, dtype=torch.float32) / (resolution[0] - 1)
-                y = torch.arange(resolution[1], device=device, dtype=torch.float32) / (resolution[1] - 1)
-                z = torch.arange(resolution[2], device=device, dtype=torch.float32) / (resolution[2] - 1)
+            with torch.no_grad():
+                for z in range(resolution[2]):
+                    x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
+                    y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
+                    z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
 
-                # Create the grid using meshgrid
-                yv, zv = torch.meshgrid([y, z])
+                    # Create the grid using meshgrid
+                    yv, xv = torch.meshgrid([y, x])
 
-                # Stack the coordinates along the last dimension and reshape
-                # xv, yv, zv / xv, zv, yv / yv, xv, zv / yv, zv, xv / zv, xv, yv / zv, yv, xv
-                yz = torch.stack((yv.flatten(), zv.flatten())).t()
-                xyz = torch.cat((x_coord, yz), dim=1)
+                    # Stack the coordinates along the last dimension and reshape
+                    yx = torch.stack((yv.flatten(), xv.flatten())).t()
+                    zyx = torch.cat((z_coord, yx), dim=1)
+                    xyz = zyx[:, [2, 1, 0]]
                     
-                with torch.no_grad():
-                    write_volume(
-                        path, 
-                        model_inference_only(coords=xyz, n_pos_dims=n_pos_dims, partition_size=partition_size, 
-                                             encodings=encodings, network=network).reshape([resolution[1], resolution[2]]
-                                            ).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
-                        dtype=args.data_type,
-                        # calculate offset by the number of elements in yz plane with 1 bytes of uint8
-                        offset= x * resolution[1] * resolution[2] * 1
-                    )
+                    # temporary solumtion for inferencing large dataset
+                    # need to refactor for better structure and flexibility for different dataset
+                    num_chunks = 2
+                    assert (xyz.shape[0] % num_chunks) == 0 
+                    chunk_size = int(xyz.shape[0] / num_chunks)
+                    for chunk_idx in range(num_chunks):
+                        chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+                        
+                        targets = torch.zeros([chunk.shape[0], 1]).float()
+                        spl.decode(sampler, chunk, targets)
+                        chunk = chunk.to(device_name)
+                        targets = targets.to(device_name)
+                        enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
+                        output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
+                                                partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
+                        squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
+                        write_volume(
+                            path, 
+                            # output.reshape([resolution[0], resolution[1]]
+                            #             ).detach().cpu().numpy() * args.max_val,
+                            output.detach().cpu().numpy() * args.max_val,
+                            dtype=args.type,
+                            # calculate offset by the number of elements in xy plane and chunk offset
+                            offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
+                        )
             print("done.")
+            PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
+            print("PSNR:", PSNR)
 
             # Ignore the time spent saving the image
             prev_time = time.perf_counter()
 
             if i > 0 and interval < 1000:
                 interval *= 10
+
+        # adjust encoders parameters after inference or train in this iteration
+        # print("iter: ", i, end=" // ")
+        # compare the loss between different encoders
+        loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
+        for j in range(partition_size ** n_pos_dims):
+            group_idx = torch.nonzero(enc_idx == j).squeeze()
+            loss_of_encoders[j] = relative_l2_error[group_idx].mean()
+        # print(" max idx:", torch.argmax(loss_of_encoders), " min idx:", torch.argmin(loss_of_encoders))
+        
         # print("==================================================")
     if args.result_filename:
         print(f"Writing '{args.result_filename}'... ", end="")
+        
+        squared_errors_sum = 0
         # Generate coordinates of regular gird on yz slices
-        # x = torch.arange(args.dims[0]).to("xpu")
-        for x in range(resolution[0]):
-            x_coord = torch.full((resolution[1] * resolution[2], 1), x, device=device, dtype=torch.float32) / (resolution[0] - 1)
-            y = torch.arange(resolution[1], device=device, dtype=torch.float32) / (resolution[1] - 1)
-            z = torch.arange(resolution[2], device=device, dtype=torch.float32) / (resolution[2] - 1)
+        with torch.no_grad():
+            for z in range(resolution[2]):
+                x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
+                y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
+                z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
 
-            # Create the grid using meshgrid
-            yv, zv = torch.meshgrid([y, z])
+                # Create the grid using meshgrid
+                yv, xv = torch.meshgrid([y, x])
 
-            # Stack the coordinates along the last dimension and reshape
-            # xv, yv, zv / xv, zv, yv / yv, xv, zv / yv, zv, xv / zv, xv, yv / zv, yv, xv
-            yz = torch.stack((yv.flatten(), zv.flatten())).t()
-            xyz = torch.cat((x_coord, yz), dim=1)
+                # Stack the coordinates along the last dimension and reshape
+                yx = torch.stack((yv.flatten(), xv.flatten())).t()
+                zyx = torch.cat((z_coord, yx), dim=1)
+                xyz = zyx[:, [2, 1, 0]]
                 
-            with torch.no_grad():
-                write_volume(
-                    args.result_filename,
-                    model_inference_only(coords=xyz, n_pos_dims=n_pos_dims, partition_size=partition_size, 
-                                         encodings=encodings, network=network).reshape([resolution[1], resolution[2]]
-                                        ).clamp(0.0, 1.0).detach().cpu().numpy() * image.max_function_value,
-                    dtype=args.data_type,
-                    # calculate offset by the number of elements in yz plane with 1 bytes of uint8
-                    offset= x * resolution[1] * resolution[2] * 1
-                )
+                # temporary solumtion for inferencing large dataset
+                # need to refactor for better structure and flexibility for different dataset
+                num_chunks = 2
+                assert (xyz.shape[0] % num_chunks) == 0 
+                chunk_size = int(xyz.shape[0] / num_chunks)
+                for chunk_idx in range(num_chunks):
+                    chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+                    
+                    targets = torch.zeros([chunk.shape[0], 1]).float()
+                    spl.decode(sampler, chunk, targets)
+                    chunk = chunk.to(device_name)
+                    targets = targets.to(device_name)
+                    enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
+                    output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
+                                            partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
+                    squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
+                    write_volume(
+                        args.result_filename, 
+                        # output.reshape([resolution[0], resolution[1]]
+                        #             ).detach().cpu().numpy() * args.max_val,
+                        output.detach().cpu().numpy() * args.max_val,
+                        dtype=args.type,
+                        # calculate offset by the number of elements in xy plane and chunk offset
+                        offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
+                    )
         print("done.")
+        PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
+        print("PSNR:", PSNR)
 
 if __name__ == "__main__":
     main()
