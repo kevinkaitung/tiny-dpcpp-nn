@@ -6,3 +6,5 @@ tests/*.png
 
 *.raw
 !data/images/bonsai.raw
+
+records_of_diff_partition_size*.json
