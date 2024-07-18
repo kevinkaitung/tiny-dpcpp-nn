@@ -167,6 +167,19 @@ def main():
     n_channels = 1
     sampler = spl.create_sampler("structuredRegular", "openvkl", filename=args.filename, dims=args.dims, dtype=args.type, n_channels=n_channels)
 
+    records_of_diff_partition_sizes = dict()
+    
+    test_partition_sizes = [1]
+    for sz in test_partition_sizes:
+        records_of_diff_partition_sizes = train_volume(device_name=device_name, device=device, args=args, config=config, n_channels=n_channels, sampler=sampler, partition_size=sz)
+
+        file_name = 'records_of_diff_partition_sizes_'+str(sz)+'.json'
+        # Write the data to a JSON file
+        with open(file_name, 'w') as file:
+            json.dump(records_of_diff_partition_sizes, file, indent=4) 
+
+def train_volume(device_name, device, args, config, n_channels, sampler, partition_size):
+
     # model = tnn.NetworkWithInputEncoding(
     #     n_input_dims=3,
     #     n_output_dims=n_channels,
@@ -179,7 +192,7 @@ def main():
     # tnn.Network when you don't want to combine them. Otherwise, use tnn.NetworkWithInputEncoding.
     # ===================================================================================================
 
-    partition_size = 2
+    # partition_size = 2
     n_pos_dims = 3
     # encoding = tnn.Encoding(
     #     n_input_dims=3,
@@ -230,6 +243,11 @@ def main():
 
     print(f"Beginning optimization with {args.n_steps} training steps.")
 
+    # prepare data to write to json
+    records = dict()
+    step_in_records = []
+    loss_in_records = []
+    PSNR_in_records = []
 
     for i in range(args.n_steps):
         # mini_batches, mini_batch_size = generate_batch_samples(batch_size=batch_size, partition_size=partition_size, n_pos_dims=n_pos_dims, device=device)
@@ -308,18 +326,23 @@ def main():
                         output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
                                                 partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
                         squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
-                        write_volume(
-                            path, 
-                            # output.reshape([resolution[0], resolution[1]]
-                            #             ).detach().cpu().numpy() * args.max_val,
-                            output.detach().cpu().numpy() * args.max_val,
-                            dtype=args.type,
-                            # calculate offset by the number of elements in xy plane and chunk offset
-                            offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
-                        )
+                        # write_volume(
+                        #     path, 
+                        #     # output.reshape([resolution[0], resolution[1]]
+                        #     #             ).detach().cpu().numpy() * args.max_val,
+                        #     output.detach().cpu().numpy() * args.max_val,
+                        #     dtype=args.type,
+                        #     # calculate offset by the number of elements in xy plane and chunk offset
+                        #     offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
+                        # )
             print("done.")
             PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
             print("PSNR:", PSNR)
+            
+            # add loss and PSNR of this iteration to the records
+            step_in_records.append(i)
+            loss_in_records.append(loss_val)
+            PSNR_in_records.append(PSNR.item())
 
             # Ignore the time spent saving the image
             prev_time = time.perf_counter()
@@ -330,60 +353,65 @@ def main():
         # adjust encoders parameters after inference or train in this iteration
         # print("iter: ", i, end=" // ")
         # compare the loss between different encoders
-        loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
-        for j in range(partition_size ** n_pos_dims):
-            group_idx = torch.nonzero(enc_idx == j).squeeze()
-            loss_of_encoders[j] = relative_l2_error[group_idx].mean()
+        # loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
+        # for j in range(partition_size ** n_pos_dims):
+        #     group_idx = torch.nonzero(enc_idx == j).squeeze()
+        #     loss_of_encoders[j] = relative_l2_error[group_idx].mean()
         # print(" max idx:", torch.argmax(loss_of_encoders), " min idx:", torch.argmin(loss_of_encoders))
         
         # print("==================================================")
-    if args.result_filename:
-        print(f"Writing '{args.result_filename}'... ", end="")
+    
+    records["step"] = step_in_records
+    records["loss"] = loss_in_records
+    records["PSNR"] = PSNR_in_records
+    return records
+    # if args.result_filename:
+    #     print(f"Writing '{args.result_filename}'... ", end="")
         
-        squared_errors_sum = 0
-        # Generate coordinates of regular gird on yz slices
-        with torch.no_grad():
-            for z in range(resolution[2]):
-                x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
-                y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
-                z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
+    #     squared_errors_sum = 0
+    #     # Generate coordinates of regular gird on yz slices
+    #     with torch.no_grad():
+    #         for z in range(resolution[2]):
+    #             x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
+    #             y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
+    #             z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
 
-                # Create the grid using meshgrid
-                yv, xv = torch.meshgrid([y, x])
+    #             # Create the grid using meshgrid
+    #             yv, xv = torch.meshgrid([y, x])
 
-                # Stack the coordinates along the last dimension and reshape
-                yx = torch.stack((yv.flatten(), xv.flatten())).t()
-                zyx = torch.cat((z_coord, yx), dim=1)
-                xyz = zyx[:, [2, 1, 0]]
+    #             # Stack the coordinates along the last dimension and reshape
+    #             yx = torch.stack((yv.flatten(), xv.flatten())).t()
+    #             zyx = torch.cat((z_coord, yx), dim=1)
+    #             xyz = zyx[:, [2, 1, 0]]
                 
-                # temporary solumtion for inferencing large dataset
-                # need to refactor for better structure and flexibility for different dataset
-                num_chunks = 2
-                assert (xyz.shape[0] % num_chunks) == 0 
-                chunk_size = int(xyz.shape[0] / num_chunks)
-                for chunk_idx in range(num_chunks):
-                    chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+    #             # temporary solumtion for inferencing large dataset
+    #             # need to refactor for better structure and flexibility for different dataset
+    #             num_chunks = 2
+    #             assert (xyz.shape[0] % num_chunks) == 0 
+    #             chunk_size = int(xyz.shape[0] / num_chunks)
+    #             for chunk_idx in range(num_chunks):
+    #                 chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
                     
-                    targets = torch.zeros([chunk.shape[0], 1]).float()
-                    spl.decode(sampler, chunk, targets)
-                    chunk = chunk.to(device_name)
-                    targets = targets.to(device_name)
-                    enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
-                    output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
-                                            partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
-                    squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
-                    write_volume(
-                        args.result_filename, 
-                        # output.reshape([resolution[0], resolution[1]]
-                        #             ).detach().cpu().numpy() * args.max_val,
-                        output.detach().cpu().numpy() * args.max_val,
-                        dtype=args.type,
-                        # calculate offset by the number of elements in xy plane and chunk offset
-                        offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
-                    )
-        print("done.")
-        PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
-        print("PSNR:", PSNR)
+    #                 targets = torch.zeros([chunk.shape[0], 1]).float()
+    #                 spl.decode(sampler, chunk, targets)
+    #                 chunk = chunk.to(device_name)
+    #                 targets = targets.to(device_name)
+    #                 enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
+    #                 output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
+    #                                         partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
+    #                 squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
+    #                 # write_volume(
+    #                 #     args.result_filename, 
+    #                 #     # output.reshape([resolution[0], resolution[1]]
+    #                 #     #             ).detach().cpu().numpy() * args.max_val,
+    #                 #     output.detach().cpu().numpy() * args.max_val,
+    #                 #     dtype=args.type,
+    #                 #     # calculate offset by the number of elements in xy plane and chunk offset
+    #                 #     offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
+    #                 # )
+    #     print("done.")
+    #     PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
+    #     print("PSNR:", PSNR)
 
 if __name__ == "__main__":
     main()
