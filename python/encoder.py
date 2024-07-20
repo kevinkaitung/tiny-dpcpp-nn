@@ -151,6 +151,7 @@ class HashEmbedderNative(nn.Module):
         self.params = nn.Parameter(data=new_params)
         # register these parameters to this model (nn.Module)
         self.register_parameter("params", self.params)
+        return self.log2_hashmap_size
 
     def get_params(self):
         return self.params
