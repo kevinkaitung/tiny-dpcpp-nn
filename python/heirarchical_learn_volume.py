@@ -194,6 +194,10 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
 
     # partition_size = 2
     n_pos_dims = 3
+    # calculate the times of each encoder has the max loss in a iteration
+    encoders_max_loss_counts = torch.zeros(partition_size ** n_pos_dims, dtype=torch.int32)
+    # frequency to increase hash map size for an encoder
+    hashmap_size_incre_freq = 200
     # encoding = tnn.Encoding(
     #     n_input_dims=3,
     #     encoding_config=config["encoding"],
@@ -350,14 +354,22 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
             if i > 0 and interval < 1000:
                 interval *= 10
 
-        # adjust encoders parameters after inference or train in this iteration
-        # print("iter: ", i, end=" // ")
+        # adjust encoders parameters after inferencing or training in this iteration
         # compare the loss between different encoders
-        # loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
-        # for j in range(partition_size ** n_pos_dims):
-        #     group_idx = torch.nonzero(enc_idx == j).squeeze()
-        #     loss_of_encoders[j] = relative_l2_error[group_idx].mean()
-        # print(" max idx:", torch.argmax(loss_of_encoders), " min idx:", torch.argmin(loss_of_encoders))
+        loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
+        for j in range(partition_size ** n_pos_dims):
+            group_idx = torch.nonzero(enc_idx == j).squeeze().to(torch.int64)
+            loss_of_encoders[j] = relative_l2_error[group_idx].mean()
+        # get index of the encoder who has max loss
+        max_loss_enc_idx = torch.argmax(loss_of_encoders)
+        encoders_max_loss_counts[max_loss_enc_idx] += 1
+        # print("iter:", i, " times of encoders with max loss:", encoders_max_loss_counts)
+        # if a certain encoder reach the frequency, increase the hash map size of that encoder
+        if encoders_max_loss_counts[max_loss_enc_idx] % hashmap_size_incre_freq == 0:
+            new_size = encodings[max_loss_enc_idx].increase_embedding_size_by_two()
+            print("iter:", i, " encoder idx ", max_loss_enc_idx, " increase hash map size to 2^", new_size)
+            # recreate optimizer to update encodings parameters
+            optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
         
         # print("==================================================")
     

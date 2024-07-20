@@ -73,6 +73,85 @@ class HashEmbedderNative(nn.Module):
         # initialize these parameters
         nn.init.uniform_(self.params, -1e-4 * scale, 1e-4 * scale)
 
+    def increase_embedding_size_by_two(self):
+        new_log2_hashmap_size = self.log2_hashmap_size + 1
+        # exceed increasing limit, return immediately
+        if new_log2_hashmap_size > 24:
+            return
+        
+        new_embedding_offsets = []
+        new_embedding_lengths = []
+        offset = 0
+        new_params = []
+        for i in range(self.n_levels):
+            scale = self.grid_scale(i, self.per_level_scale, self.base_resolution)
+            resolution = self.grid_resolution(scale)
+            length = resolution ** self.n_pos_dims
+            length = (length + 8 - 1) // 8 * 8  # Make sure memory accesses will be aligned
+            # case 1: dense grid -> dense grid (just copy the table in that level)
+            if length <= (1 << self.log2_hashmap_size):
+                new_params.append(self.get_params()[self.embedding_offsets[i] * self.n_features_per_level:
+                    self.embedding_offsets[i] * self.n_features_per_level + self.embedding_lengths[i] * self.n_features_per_level])
+                # use dense grid size as length
+                length = length
+            # case 2: hash grid -> dense grid (convert hash grid to dense grid)
+            elif length > (1 << self.log2_hashmap_size) and length <= (1 << new_log2_hashmap_size):
+                HASH = coherent_prime_hash # TCNN provides multiple hash functions
+                # traverse all grid points on dense grid and
+                # hash them to query the weights in original hash table
+                # and then copy those queried weights to new hash table
+                with torch.no_grad():
+                    # create dense grid points
+                    x = torch.arange(resolution, dtype=torch.float32)
+                    y = torch.arange(resolution, dtype=torch.float32)
+                    z = torch.arange(resolution, dtype=torch.float32)
+                    zv, yv, xv = torch.meshgrid([z, y, x])
+                    xyz = torch.stack((zv.flatten(), yv.flatten(), xv.flatten())).t()
+                    xyz = xyz[:, [2, 1, 0]]
+                    # xyz = xyz.to("xpu")
+                    
+                # hash dense grid points (xyz) to get hashed indices
+                hashed_indices = HASH(xyz) % self.embedding_lengths[i]
+                # offset indices to the head of each feature vector (because each vector has n_features_per_level dimensions)
+                hashed_indices = hashed_indices * self.n_features_per_level
+                # offset indices to the begining of that level
+                hashed_indices = hashed_indices + self.embedding_offsets[i] * self.n_features_per_level
+                # expand hashed indices to access all elements in each feature vector
+                hashed_indices = torch.stack([hashed_indices + ith for ith in range(self.n_features_per_level)], dim=1)
+                hashed_indices = hashed_indices.view(-1)
+                hashed_indices = hashed_indices.to("xpu")
+                # use indices to query the original hash table and store them as the new table
+                # must cast hashed_indices to int64 to avoid error (don't know why now)
+                # also need to pad new params if xyz.shape is not aligned with length
+                old_params = self.get_params()
+                new_params.append(torch.cat([old_params[hashed_indices.to(torch.int64)], 
+                                             torch.zeros((length - xyz.shape[0]) * self.n_features_per_level,
+                                                         dtype=old_params.dtype, device=old_params.device)], dim=0))
+                # use dense grid size as length
+                length = length
+            # case 3: hash grid -> hash grid (duplicate original hash table once)
+            elif length > (1 << new_log2_hashmap_size):
+                # duplicate original hash table once
+                new_params.append(self.get_params()[self.embedding_offsets[i] * self.n_features_per_level:
+                    self.embedding_offsets[i] * self.n_features_per_level + self.embedding_lengths[i] * self.n_features_per_level])
+                new_params.append(self.get_params()[self.embedding_offsets[i] * self.n_features_per_level:
+                    self.embedding_offsets[i] * self.n_features_per_level + self.embedding_lengths[i] * self.n_features_per_level])
+                # use new hash grid size as length
+                length = (1 << new_log2_hashmap_size)
+            new_embedding_offsets.append(offset)
+            new_embedding_lengths.append(length)
+            offset += length
+            
+        # update new parameters in class
+        self.embedding_offsets = new_embedding_offsets
+        self.embedding_lengths = new_embedding_lengths
+        self.log2_hashmap_size = new_log2_hashmap_size
+        
+        new_params = torch.cat(new_params, dim=0)
+        self.params = nn.Parameter(data=new_params)
+        # register these parameters to this model (nn.Module)
+        self.register_parameter("params", self.params)
+
     def get_params(self):
         return self.params
 
