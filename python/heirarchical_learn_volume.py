@@ -38,6 +38,7 @@ import time
 import torch.nn as nn
 from torch.func import stack_module_state, functional_call
 from torch import vmap
+from torch.utils.tensorboard import SummaryWriter
 import copy
 
 try:
@@ -69,19 +70,23 @@ def get_args():
     # for dvnr volume sampler
     parser.add_argument(
         # '--filename', type=str, default="data/images/chameleon_1024x1024x1080_float32.raw", help="volume data file"
-        '--filename', type=str, default="data/images/bonsai.raw", help="volume data file"
+        # '--filename', type=str, default="data/images/bonsai.raw", help="volume data file"
+        '--filename', type=str, default="data/images/1atm.H2O.3x.1152.320.853f32.bin", help="volume data file"
     )
     parser.add_argument(
         # "--dims", type=int, nargs=3, default=[1024, 1024, 1080], help="volume data dimensions"
-        "--dims", type=int, nargs=3, default=[256, 256, 256], help="volume data dimensions"
+        # "--dims", type=int, nargs=3, default=[256, 256, 256], help="volume data dimensions"
+        "--dims", type=int, nargs=3, default=[1152, 320, 853], help="volume data dimensions"
     )
     parser.add_argument(
         # "--type", type=str, default="float32", help="volume data type"
-        "--type", type=str, default="uint8", help="volume data type"
+        # "--type", type=str, default="uint8", help="volume data type"
+        "--type", type=str, default="float32", help="volume data type"
     )
     parser.add_argument(
         # "--max_val", type=float, default=1.0, help="volume data maximum value"
-        "--max_val", type=float, default=255.0, help="volume data maximum value"
+        # "--max_val", type=float, default=255.0, help="volume data maximum value"
+        "--max_val", type=float, default=1.0, help="volume data maximum value"
     )
     parser.add_argument(
         "config",
@@ -191,7 +196,10 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
     # The following is equivalent to the above, but slower. Only use "naked" tnn.Encoding and
     # tnn.Network when you don't want to combine them. Otherwise, use tnn.NetworkWithInputEncoding.
     # ===================================================================================================
-
+    track_loss = True
+    calculate_PSNR = True
+    if track_loss:
+        writer = SummaryWriter()
     # partition_size = 2
     n_pos_dims = 3
     # calculate the times of each encoder has the max loss in a iteration
@@ -223,6 +231,8 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
     # enc_optimizer = torch.optim.Adam(params.values(), lr=1e-3)
     
     optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
+    # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
+    # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
 
     # Variables for saving/displaying image results
     resolution = args.dims
@@ -283,11 +293,34 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
             output.detach() ** 2 + 0.01
         )
 
+        # net_optimizer.zero_grad()
+        # calculate loss of each encoder
+        loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
+        for j in range(partition_size ** n_pos_dims):
+            # enc_optimizer.zero_grad()
+            group_idx = torch.nonzero(enc_idx == j).squeeze().to(torch.int64)
+            loss_of_encoders[j] = relative_l2_error[group_idx].mean()
+            # if j == partition_size ** n_pos_dims - 1:
+            #     loss_of_encoders[j].backward(retain_graph=False)
+            # else:
+            #     loss_of_encoders[j].backward(retain_graph=True)
+            # enc_optimizer.step()
+        # net_optimizer.step()
+        # get index of the encoder who has max loss
+        max_loss_enc_idx = torch.argmax(loss_of_encoders)
+        encoders_max_loss_counts[max_loss_enc_idx] += 1
+        
+
+        # total loss
         loss = relative_l2_error.mean()
 
         optimizer.zero_grad()
+        # enc_optimizer.zero_grad()
+        # net_optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        # enc_optimizer.step()
+        # net_optimizer.step()
 
         if i % interval == 0:
             loss_val = loss.item()
@@ -298,55 +331,56 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
             path = f"{i}.raw"
             print(f"Writing '{path}'... ", end="")
                         
-            squared_errors_sum = 0
-            # Generate coordinates of regular gird on yz slices
-            with torch.no_grad():
-                for z in range(resolution[2]):
-                    x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
-                    y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
-                    z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
+            if calculate_PSNR:
+                squared_errors_sum = 0
+                # Generate coordinates of regular gird on yz slices
+                with torch.no_grad():
+                    for z in range(resolution[2]):
+                        x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
+                        y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
+                        z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
 
-                    # Create the grid using meshgrid
-                    yv, xv = torch.meshgrid([y, x])
+                        # Create the grid using meshgrid
+                        yv, xv = torch.meshgrid([y, x])
 
-                    # Stack the coordinates along the last dimension and reshape
-                    yx = torch.stack((yv.flatten(), xv.flatten())).t()
-                    zyx = torch.cat((z_coord, yx), dim=1)
-                    xyz = zyx[:, [2, 1, 0]]
-                    
-                    # temporary solumtion for inferencing large dataset
-                    # need to refactor for better structure and flexibility for different dataset
-                    num_chunks = 2
-                    assert (xyz.shape[0] % num_chunks) == 0 
-                    chunk_size = int(xyz.shape[0] / num_chunks)
-                    for chunk_idx in range(num_chunks):
-                        chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+                        # Stack the coordinates along the last dimension and reshape
+                        yx = torch.stack((yv.flatten(), xv.flatten())).t()
+                        zyx = torch.cat((z_coord, yx), dim=1)
+                        xyz = zyx[:, [2, 1, 0]]
                         
-                        targets = torch.zeros([chunk.shape[0], 1]).float()
-                        spl.decode(sampler, chunk, targets)
-                        chunk = chunk.to(device_name)
-                        targets = targets.to(device_name)
-                        enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
-                        output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
-                                                partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
-                        squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
-                        # write_volume(
-                        #     path, 
-                        #     # output.reshape([resolution[0], resolution[1]]
-                        #     #             ).detach().cpu().numpy() * args.max_val,
-                        #     output.detach().cpu().numpy() * args.max_val,
-                        #     dtype=args.type,
-                        #     # calculate offset by the number of elements in xy plane and chunk offset
-                        #     offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
-                        # )
-            print("done.")
-            PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
-            print("PSNR:", PSNR)
-            
-            # add loss and PSNR of this iteration to the records
-            step_in_records.append(i)
-            loss_in_records.append(loss_val)
-            PSNR_in_records.append(PSNR.item())
+                        # temporary solumtion for inferencing large dataset
+                        # need to refactor for better structure and flexibility for different dataset
+                        num_chunks = 2
+                        assert (xyz.shape[0] % num_chunks) == 0 
+                        chunk_size = int(xyz.shape[0] / num_chunks)
+                        for chunk_idx in range(num_chunks):
+                            chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+                            
+                            targets = torch.zeros([chunk.shape[0], 1]).float()
+                            spl.decode(sampler, chunk, targets)
+                            chunk = chunk.to(device_name)
+                            targets = targets.to(device_name)
+                            enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
+                            output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
+                                                    partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
+                            squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
+                            # write_volume(
+                            #     path, 
+                            #     # output.reshape([resolution[0], resolution[1]]
+                            #     #             ).detach().cpu().numpy() * args.max_val,
+                            #     output.detach().cpu().numpy() * args.max_val,
+                            #     dtype=args.type,
+                            #     # calculate offset by the number of elements in xy plane and chunk offset
+                            #     offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
+                            # )
+                print("done.")
+                PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
+                print("PSNR:", PSNR)
+                
+                # add loss and PSNR of this iteration to the records
+                step_in_records.append(i)
+                loss_in_records.append(loss_val)
+                PSNR_in_records.append(PSNR.item())
 
             # Ignore the time spent saving the image
             prev_time = time.perf_counter()
@@ -355,27 +389,37 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
                 interval *= 10
 
         # adjust encoders parameters after inferencing or training in this iteration
-        # compare the loss between different encoders
-        loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
-        for j in range(partition_size ** n_pos_dims):
-            group_idx = torch.nonzero(enc_idx == j).squeeze().to(torch.int64)
-            loss_of_encoders[j] = relative_l2_error[group_idx].mean()
-        # get index of the encoder who has max loss
-        max_loss_enc_idx = torch.argmax(loss_of_encoders)
-        encoders_max_loss_counts[max_loss_enc_idx] += 1
-        # print("iter:", i, " times of encoders with max loss:", encoders_max_loss_counts)
         # if a certain encoder reach the frequency, increase the hash map size of that encoder
         if encoders_max_loss_counts[max_loss_enc_idx] % hashmap_size_incre_freq == 0:
             new_size = encodings[max_loss_enc_idx].increase_embedding_size_by_two()
             print("iter:", i, " encoder idx ", max_loss_enc_idx, " increase hash map size to 2^", new_size)
-            # recreate optimizer to update encodings parameters
-            optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
+            # add new parameters to encodings parameters in current optimizer
+            optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
+            # recreate optimizer
+            # optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
+            # enc_optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
+            # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
+            # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+        
+        # track losses with tensorboard
+        # add loss of each encoder in dictionary form
+        if track_loss:
+            losses_for_tensorboard = dict()
+            for j in range(loss_of_encoders.shape[0]):
+                losses_for_tensorboard["encoder_" + str(j)] = loss_of_encoders[j]
+            losses_for_tensorboard["average"] = loss
+            writer.add_scalars("Loss/train", losses_for_tensorboard, i)
         
         # print("==================================================")
     
     records["step"] = step_in_records
     records["loss"] = loss_in_records
     records["PSNR"] = PSNR_in_records
+    
+    if track_loss:
+        writer.flush()
+        writer.close()
+    
     return records
     # if args.result_filename:
     #     print(f"Writing '{args.result_filename}'... ", end="")

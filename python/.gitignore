@@ -8,3 +8,8 @@ tests/*.png
 !data/images/bonsai.raw
 
 records_of_diff_partition_size*.json
+
+# for tensorboard data
+runs
+
+*.bin
