@@ -174,7 +174,7 @@ def main():
 
     records_of_diff_partition_sizes = dict()
     
-    test_partition_sizes = [1]
+    test_partition_sizes = [2]
     for sz in test_partition_sizes:
         records_of_diff_partition_sizes = train_volume(device_name=device_name, device=device, args=args, config=config, n_channels=n_channels, sampler=sampler, partition_size=sz)
 
@@ -203,7 +203,7 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
     # partition_size = 2
     n_pos_dims = 3
     # calculate the times of each encoder has the max loss in a iteration
-    encoders_max_loss_counts = torch.zeros(partition_size ** n_pos_dims, dtype=torch.int32)
+    encoders_max_loss_counts = torch.zeros(partition_size ** n_pos_dims, dtype=torch.int32, device=device)
     # frequency to increase hash map size for an encoder
     hashmap_size_incre_freq = 200
     # encoding = tnn.Encoding(
@@ -307,12 +307,13 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
             # enc_optimizer.step()
         # net_optimizer.step()
         # get index of the encoder who has max loss
-        max_loss_enc_idx = torch.argmax(loss_of_encoders)
-        encoders_max_loss_counts[max_loss_enc_idx] += 1
         
 
         # total loss
         loss = relative_l2_error.mean()
+        # find encoders whose losses are larger than average
+        large_loss_enc_idx = torch.nonzero(loss_of_encoders > loss)
+        encoders_max_loss_counts[large_loss_enc_idx] += 1
 
         optimizer.zero_grad()
         # enc_optimizer.zero_grad()
@@ -390,16 +391,17 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
 
         # adjust encoders parameters after inferencing or training in this iteration
         # if a certain encoder reach the frequency, increase the hash map size of that encoder
-        if encoders_max_loss_counts[max_loss_enc_idx] % hashmap_size_incre_freq == 0:
-            new_size = encodings[max_loss_enc_idx].increase_embedding_size_by_two()
-            print("iter:", i, " encoder idx ", max_loss_enc_idx, " increase hash map size to 2^", new_size)
-            # add new parameters to encodings parameters in current optimizer
-            optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
-            # recreate optimizer
-            # optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
-            # enc_optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
-            # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
-            # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+        for j in large_loss_enc_idx:
+            if encoders_max_loss_counts[j] % hashmap_size_incre_freq == 0:
+                new_size = encodings[j].increase_embedding_size_by_two()
+                print("iter:", i, " encoder idx ", j, " increase hash map size to 2^", new_size)
+                # add new parameters to encodings parameters in current optimizer
+                optimizer.add_param_group({"params": encodings[j].parameters()})
+                # recreate optimizer
+                # optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
+                # enc_optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
+                # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
+                # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
         
         # track losses with tensorboard
         # add loss of each encoder in dictionary form
