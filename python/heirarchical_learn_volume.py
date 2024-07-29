@@ -202,217 +202,239 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
         writer = SummaryWriter()
     # partition_size = 2
     n_pos_dims = 3
-    # calculate the times of each encoder has the max loss in a iteration
-    encoders_max_loss_counts = torch.zeros(partition_size ** n_pos_dims, dtype=torch.int32, device=device)
-    # frequency to increase hash map size for an encoder
-    hashmap_size_incre_freq = 200
-    # encoding = tnn.Encoding(
-    #     n_input_dims=3,
-    #     encoding_config=config["encoding"],
-    #     dtype=torch.float,
-    # )
-    # encoding = HeirarchicalHashEmbedderNative(n_pos_dims=3, partition_size=2, individual_encoding_config=config["encoding"])
-    encodings = nn.ModuleList([HashEmbedderNative(n_pos_dims=n_pos_dims, encoding_config=config["encoding"]).to(device)
-                                            for _ in range(partition_size ** n_pos_dims)])
-    # network = tnn.Network(
-    #     n_input_dims=encoding.n_output_dims,
-    #     n_output_dims=n_channels,
-    #     network_config=config["network"],
-    # )
-    network = MLP_Native(n_input_dims=encodings[0].n_output_dims, n_output_dims=n_channels, network_config=config["network"]).to(device)
-    # models = nn.ModuleList([torch.nn.Sequential(encoding, network).to(device) for encoding in encodings])
+    try_runs = 1
+    avg_enc_losses_all_runs = []
+    avg_all_loss_all_runs = []
+    for it in range(try_runs):
+        avg_enc_losses_one_run = []
+        avg_all_loss_one_run = []
+        # calculate the times of each encoder has the max loss in a iteration
+        encoders_max_loss_counts = torch.zeros(partition_size ** n_pos_dims, dtype=torch.int32, device=device)
+        # frequency to increase hash map size for an encoder
+        hashmap_size_incre_freq = 200
+        # encoding = tnn.Encoding(
+        #     n_input_dims=3,
+        #     encoding_config=config["encoding"],
+        #     dtype=torch.float,
+        # )
+        # encoding = HeirarchicalHashEmbedderNative(n_pos_dims=3, partition_size=2, individual_encoding_config=config["encoding"])
+        encodings = nn.ModuleList([HashEmbedderNative(n_pos_dims=n_pos_dims, encoding_config=config["encoding"]).to(device)
+                                                for _ in range(partition_size ** n_pos_dims)])
+        # network = tnn.Network(
+        #     n_input_dims=encoding.n_output_dims,
+        #     n_output_dims=n_channels,
+        #     network_config=config["network"],
+        # )
+        network = MLP_Native(n_input_dims=encodings[0].n_output_dims, n_output_dims=n_channels, network_config=config["network"]).to(device)
+        # models = nn.ModuleList([torch.nn.Sequential(encoding, network).to(device) for encoding in encodings])
 
-    # version with using vmap
-    # params, buffers = stack_module_state(encodings)
-    # base_model = copy.deepcopy(encodings[0])
-    # base_model = base_model.to('meta')
-    # def fmodel(params, buffers, x):
-    #     return functional_call(base_model, (params, buffers), (x,))
-    # enc_optimizer = torch.optim.Adam(params.values(), lr=1e-3)
-    
-    optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
-    # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
-    # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
-
-    # Variables for saving/displaying image results
-    resolution = args.dims
-    
-    # # Generate coordinates of regular grid
-    # x = torch.arange(resolution[0], dtype=torch.float32, device=device) / (resolution[0] - 1)
-    # y = torch.arange(resolution[1], dtype=torch.float32, device=device) / (resolution[1] - 1)
-    # z = torch.arange(resolution[2], dtype=torch.float32, device=device) / (resolution[2] - 1)
-
-    # # Create the grid using meshgrid
-    # zv, yv, xv = torch.meshgrid([z, y, x])
-
-    # # Stack the coordinates along the last dimension and reshape
-    # zyx = torch.stack((zv.flatten() ,yv.flatten(), xv.flatten())).t()
-    # xyz = zyx[:, [2, 1, 0]]
-    # # print(zyx)
-    
-    prev_time = time.perf_counter()
-
-    batch_size = 2**16
-    interval = 10
-
-    print(f"Beginning optimization with {args.n_steps} training steps.")
-
-    # prepare data to write to json
-    records = dict()
-    step_in_records = []
-    loss_in_records = []
-    PSNR_in_records = []
-
-    for i in range(args.n_steps):
-        # mini_batches, mini_batch_size = generate_batch_samples(batch_size=batch_size, partition_size=partition_size, n_pos_dims=n_pos_dims, device=device)
-        # targets = traced_image(mini_batches.view(-1, 3))
-        
-        coords, targets = spl.sample(sampler, batch_size)
-        coords = coords.to(device_name)
-        targets = targets.to(device_name)
-        
         # version with using vmap
-        # shape of enc_output is [number of encoders, mini batch size, number of feature vec dims]
-        # enc_output = vmap(fmodel)(params, buffers, mini_batches)
-        # enc_output = enc_output.view(-1, encodings[0].n_output_dims)
+        # params, buffers = stack_module_state(encodings)
+        # base_model = copy.deepcopy(encodings[0])
+        # base_model = base_model.to('meta')
+        # def fmodel(params, buffers, x):
+        #     return functional_call(base_model, (params, buffers), (x,))
+        # enc_optimizer = torch.optim.Adam(params.values(), lr=1e-3)
         
-        # version without using vmap
-        # enc_output = []
-        # for mini_batch, encoding in zip(mini_batches ,encodings):
-        #     enc_output.append(encoding(mini_batch))
-        # enc_output = torch.cat(enc_output, dim=0)
+        optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
+        # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
+        # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+
+        # Variables for saving/displaying image results
+        resolution = args.dims
         
-        # output = network(enc_output)
+        # # Generate coordinates of regular grid
+        # x = torch.arange(resolution[0], dtype=torch.float32, device=device) / (resolution[0] - 1)
+        # y = torch.arange(resolution[1], dtype=torch.float32, device=device) / (resolution[1] - 1)
+        # z = torch.arange(resolution[2], dtype=torch.float32, device=device) / (resolution[2] - 1)
 
-        # version complying with the coordinates generated by dvnr sampler
-        enc_idx = get_batch_encoder_idx(coords=coords, partition_size=partition_size)
-        output = model_inference(coords=coords, enc_idx=enc_idx, n_pos_dims=n_pos_dims, partition_size=partition_size, encodings=encodings, network=network)
-        # adjust the output size to align with the target size
-        # output = output.view(-1)
-        relative_l2_error = (output - targets.to(output.dtype)) ** 2 / (
-            output.detach() ** 2 + 0.01
-        )
+        # # Create the grid using meshgrid
+        # zv, yv, xv = torch.meshgrid([z, y, x])
 
-        # net_optimizer.zero_grad()
-        # calculate loss of each encoder
-        loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
-        for j in range(partition_size ** n_pos_dims):
+        # # Stack the coordinates along the last dimension and reshape
+        # zyx = torch.stack((zv.flatten() ,yv.flatten(), xv.flatten())).t()
+        # xyz = zyx[:, [2, 1, 0]]
+        # # print(zyx)
+        
+        prev_time = time.perf_counter()
+
+        batch_size = 2**16
+        interval = 10
+
+        print(f"Beginning optimization with {args.n_steps} training steps.")
+
+        # prepare data to write to json
+        records = dict()
+        step_in_records = []
+        loss_in_records = []
+        PSNR_in_records = []
+
+        for i in range(args.n_steps):
+            # mini_batches, mini_batch_size = generate_batch_samples(batch_size=batch_size, partition_size=partition_size, n_pos_dims=n_pos_dims, device=device)
+            # targets = traced_image(mini_batches.view(-1, 3))
+            
+            coords, targets = spl.sample(sampler, batch_size)
+            coords = coords.to(device_name)
+            targets = targets.to(device_name)
+            
+            # version with using vmap
+            # shape of enc_output is [number of encoders, mini batch size, number of feature vec dims]
+            # enc_output = vmap(fmodel)(params, buffers, mini_batches)
+            # enc_output = enc_output.view(-1, encodings[0].n_output_dims)
+            
+            # version without using vmap
+            # enc_output = []
+            # for mini_batch, encoding in zip(mini_batches ,encodings):
+            #     enc_output.append(encoding(mini_batch))
+            # enc_output = torch.cat(enc_output, dim=0)
+            
+            # output = network(enc_output)
+
+            # version complying with the coordinates generated by dvnr sampler
+            enc_idx = get_batch_encoder_idx(coords=coords, partition_size=partition_size)
+            output = model_inference(coords=coords, enc_idx=enc_idx, n_pos_dims=n_pos_dims, partition_size=partition_size, encodings=encodings, network=network)
+            # adjust the output size to align with the target size
+            # output = output.view(-1)
+            relative_l2_error = (output - targets.to(output.dtype)) ** 2 / (
+                output.detach() ** 2 + 0.01
+            )
+
+            # net_optimizer.zero_grad()
+            # calculate loss of each encoder
+            loss_of_encoders = torch.zeros(partition_size ** n_pos_dims, device=relative_l2_error.device)
+            for j in range(partition_size ** n_pos_dims):
+                # enc_optimizer.zero_grad()
+                group_idx = torch.nonzero(enc_idx == j).squeeze().to(torch.int64)
+                loss_of_encoders[j] = relative_l2_error[group_idx].mean()
+                # if j == partition_size ** n_pos_dims - 1:
+                #     loss_of_encoders[j].backward(retain_graph=False)
+                # else:
+                #     loss_of_encoders[j].backward(retain_graph=True)
+                # enc_optimizer.step()
+            # net_optimizer.step()
+            # get index of the encoder who has max loss
+            
+
+            # total loss
+            loss = relative_l2_error.mean()
+            # find encoders whose losses are larger than average
+            large_loss_enc_idx = torch.nonzero(loss_of_encoders >= loss)
+            encoders_max_loss_counts[large_loss_enc_idx] += 1
+
+            optimizer.zero_grad()
             # enc_optimizer.zero_grad()
-            group_idx = torch.nonzero(enc_idx == j).squeeze().to(torch.int64)
-            loss_of_encoders[j] = relative_l2_error[group_idx].mean()
-            # if j == partition_size ** n_pos_dims - 1:
-            #     loss_of_encoders[j].backward(retain_graph=False)
-            # else:
-            #     loss_of_encoders[j].backward(retain_graph=True)
+            # net_optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
             # enc_optimizer.step()
-        # net_optimizer.step()
-        # get index of the encoder who has max loss
-        
+            # net_optimizer.step()
 
-        # total loss
-        loss = relative_l2_error.mean()
-        # find encoders whose losses are larger than average
-        large_loss_enc_idx = torch.nonzero(loss_of_encoders > loss)
-        encoders_max_loss_counts[large_loss_enc_idx] += 1
+            if i % interval == 0:
+                loss_val = loss.item()
+                torch.xpu.synchronize()
+                elapsed_time = time.perf_counter() - prev_time
+                print(f"Step#{i}: loss={loss_val} time={int(elapsed_time*1000000)}[µs]")
 
-        optimizer.zero_grad()
-        # enc_optimizer.zero_grad()
-        # net_optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        # enc_optimizer.step()
-        # net_optimizer.step()
-
-        if i % interval == 0:
-            loss_val = loss.item()
-            torch.xpu.synchronize()
-            elapsed_time = time.perf_counter() - prev_time
-            print(f"Step#{i}: loss={loss_val} time={int(elapsed_time*1000000)}[µs]")
-
-            path = f"{i}.raw"
-            print(f"Writing '{path}'... ", end="")
-                        
-            if calculate_PSNR:
-                squared_errors_sum = 0
-                # Generate coordinates of regular gird on yz slices
-                with torch.no_grad():
-                    for z in range(resolution[2]):
-                        x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
-                        y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
-                        z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
-
-                        # Create the grid using meshgrid
-                        yv, xv = torch.meshgrid([y, x])
-
-                        # Stack the coordinates along the last dimension and reshape
-                        yx = torch.stack((yv.flatten(), xv.flatten())).t()
-                        zyx = torch.cat((z_coord, yx), dim=1)
-                        xyz = zyx[:, [2, 1, 0]]
-                        
-                        # temporary solumtion for inferencing large dataset
-                        # need to refactor for better structure and flexibility for different dataset
-                        num_chunks = 2
-                        assert (xyz.shape[0] % num_chunks) == 0 
-                        chunk_size = int(xyz.shape[0] / num_chunks)
-                        for chunk_idx in range(num_chunks):
-                            chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+                path = f"{i}.raw"
+                print(f"Writing '{path}'... ", end="")
                             
-                            targets = torch.zeros([chunk.shape[0], 1]).float()
-                            spl.decode(sampler, chunk, targets)
-                            chunk = chunk.to(device_name)
-                            targets = targets.to(device_name)
-                            enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
-                            output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
-                                                    partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
-                            squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
-                            # write_volume(
-                            #     path, 
-                            #     # output.reshape([resolution[0], resolution[1]]
-                            #     #             ).detach().cpu().numpy() * args.max_val,
-                            #     output.detach().cpu().numpy() * args.max_val,
-                            #     dtype=args.type,
-                            #     # calculate offset by the number of elements in xy plane and chunk offset
-                            #     offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
-                            # )
-                print("done.")
-                PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
-                print("PSNR:", PSNR)
-                
-                # add loss and PSNR of this iteration to the records
-                step_in_records.append(i)
-                loss_in_records.append(loss_val)
-                PSNR_in_records.append(PSNR.item())
+                if calculate_PSNR:
+                    squared_errors_sum = 0
+                    # Generate coordinates of regular gird on yz slices
+                    with torch.no_grad():
+                        for z in range(resolution[2]):
+                            x = torch.arange(resolution[0], dtype=torch.float32) / (resolution[0] - 1)
+                            y = torch.arange(resolution[1], dtype=torch.float32) / (resolution[1] - 1)
+                            z_coord = torch.full((resolution[0] * resolution[1], 1), z, dtype=torch.float32) / (resolution[2] - 1)
 
-            # Ignore the time spent saving the image
-            prev_time = time.perf_counter()
+                            # Create the grid using meshgrid
+                            yv, xv = torch.meshgrid([y, x])
 
-            if i > 0 and interval < 1000:
-                interval *= 10
+                            # Stack the coordinates along the last dimension and reshape
+                            yx = torch.stack((yv.flatten(), xv.flatten())).t()
+                            zyx = torch.cat((z_coord, yx), dim=1)
+                            xyz = zyx[:, [2, 1, 0]]
+                            
+                            # temporary solumtion for inferencing large dataset
+                            # need to refactor for better structure and flexibility for different dataset
+                            num_chunks = 2
+                            assert (xyz.shape[0] % num_chunks) == 0 
+                            chunk_size = int(xyz.shape[0] / num_chunks)
+                            for chunk_idx in range(num_chunks):
+                                chunk = xyz[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size]
+                                
+                                targets = torch.zeros([chunk.shape[0], 1]).float()
+                                spl.decode(sampler, chunk, targets)
+                                chunk = chunk.to(device_name)
+                                targets = targets.to(device_name)
+                                enc_idx_chunk = get_batch_encoder_idx(coords=chunk, partition_size=partition_size)
+                                output = model_inference(coords=chunk, enc_idx=enc_idx_chunk, n_pos_dims=n_pos_dims, 
+                                                        partition_size=partition_size, encodings=encodings, network=network).clamp(0.0, 1.0)
+                                squared_errors_sum += accumulate_squared_errors_of_slice(output=output, targets=targets)
+                                # write_volume(
+                                #     path, 
+                                #     # output.reshape([resolution[0], resolution[1]]
+                                #     #             ).detach().cpu().numpy() * args.max_val,
+                                #     output.detach().cpu().numpy() * args.max_val,
+                                #     dtype=args.type,
+                                #     # calculate offset by the number of elements in xy plane and chunk offset
+                                #     offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
+                                # )
+                    print("done.")
+                    PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
+                    print("PSNR:", PSNR)
+                    
+                    # add loss and PSNR of this iteration to the records
+                    step_in_records.append(i)
+                    loss_in_records.append(loss_val)
+                    PSNR_in_records.append(PSNR.item())
 
-        # adjust encoders parameters after inferencing or training in this iteration
-        # if a certain encoder reach the frequency, increase the hash map size of that encoder
-        for j in large_loss_enc_idx:
-            if encoders_max_loss_counts[j] % hashmap_size_incre_freq == 0:
-                new_size = encodings[j].increase_embedding_size_by_two()
-                print("iter:", i, " encoder idx ", j, " increase hash map size to 2^", new_size)
-                # add new parameters to encodings parameters in current optimizer
-                optimizer.add_param_group({"params": encodings[j].parameters()})
-                # recreate optimizer
-                # optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
-                # enc_optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
-                # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
-                # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+                # Ignore the time spent saving the image
+                prev_time = time.perf_counter()
+
+                if i > 0 and interval < 1000:
+                    interval *= 10
+
+            # adjust encoders parameters after inferencing or training in this iteration
+            # if a certain encoder reach the frequency, increase the hash map size of that encoder
+            for j in large_loss_enc_idx:
+                if encoders_max_loss_counts[j] % hashmap_size_incre_freq == 0:
+                    new_size = encodings[j].increase_embedding_size_by_two()
+                    print("iter:", i, " encoder idx ", j, " increase hash map size to 2^", new_size)
+                    # add new parameters to encodings parameters in current optimizer
+                    optimizer.add_param_group({"params": encodings[j].parameters()})
+                    # recreate optimizer
+                    # optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
+                    # enc_optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
+                    # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
+                    # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+    
+            avg_enc_losses_one_run.append(loss_of_encoders)
+            avg_all_loss_one_run.append(loss)
+            
+        avg_enc_losses_one_run = torch.stack(avg_enc_losses_one_run, dim=0)
+        avg_all_loss_one_run = torch.stack(avg_all_loss_one_run, dim=0)
         
-        # track losses with tensorboard
-        # add loss of each encoder in dictionary form
-        if track_loss:
+        avg_enc_losses_all_runs.append(avg_enc_losses_one_run)
+        avg_all_loss_all_runs.append(avg_all_loss_one_run)
+    
+    # need to improve to use memory efficiently
+    avg_enc_losses_all_runs = torch.stack(avg_enc_losses_all_runs, dim=0)
+    avg_enc_losses_all_runs = torch.mean(avg_enc_losses_all_runs, dim=0)
+    avg_all_loss_all_runs = torch.stack(avg_all_loss_all_runs, dim=0)
+    avg_all_loss_all_runs = torch.mean(avg_all_loss_all_runs, dim=0)
+        
+    # track losses with tensorboard
+    # add loss of each encoder in dictionary form
+    if track_loss:
+        for i in range(avg_enc_losses_all_runs.shape[0]):
             losses_for_tensorboard = dict()
-            for j in range(loss_of_encoders.shape[0]):
-                losses_for_tensorboard["encoder_" + str(j)] = loss_of_encoders[j]
-            losses_for_tensorboard["average"] = loss
+            for j in range(avg_enc_losses_all_runs.shape[1]):
+                losses_for_tensorboard["encoder_" + str(j)] = avg_enc_losses_all_runs[i][j]
+            losses_for_tensorboard["average"] = avg_all_loss_all_runs[i]
             writer.add_scalars("Loss/train", losses_for_tensorboard, i)
-        
-        # print("==================================================")
+            
+    # print("==================================================")
     
     records["step"] = step_in_records
     records["loss"] = loss_in_records
