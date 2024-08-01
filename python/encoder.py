@@ -75,9 +75,6 @@ class HashEmbedderNative(nn.Module):
 
     def increase_embedding_size_by_two(self):
         new_log2_hashmap_size = self.log2_hashmap_size + 1
-        # exceed increasing limit, return immediately
-        if new_log2_hashmap_size > 24:
-            return
         
         new_embedding_offsets = []
         new_embedding_lengths = []
@@ -151,13 +148,15 @@ class HashEmbedderNative(nn.Module):
         self.params = nn.Parameter(data=new_params)
         # register these parameters to this model (nn.Module)
         self.register_parameter("params", self.params)
-        return self.log2_hashmap_size
 
     def get_params(self):
         return self.params
 
     def set_params(self, params):
         self.load_state_dict({ 'params': params })
+        
+    def get_log2_hashmap_size(self):
+        return self.log2_hashmap_size
 
     # def access_embeddings(self, level:int, inputs:torch.Tensor):
     #     offset = self.embedding_offsets[level] * self.n_features_per_level
