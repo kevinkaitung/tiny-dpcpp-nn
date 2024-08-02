@@ -10,7 +10,7 @@ import intel_extension_for_pytorch
 import time
 import torch.nn as nn
 
-def read_volume(file, shape, dtype=np.uint8):
+def read_volume(file, shape, dtype, offset=0):
     """
     Reads volume data from a .raw file.
 
@@ -23,7 +23,8 @@ def read_volume(file, shape, dtype=np.uint8):
         numpy.ndarray: The volume data.
     """
     with open(file, "rb") as f:
-        volume = np.frombuffer(f.read(), dtype=dtype)
+        f.seek(offset)
+        volume = np.frombuffer(f.read(shape[0] * shape[1] * shape[2] * 4), dtype=dtype)
         # cast volume data into float32 and reshape
         volume = volume.astype(np.float32).reshape(shape)
     return volume
@@ -84,8 +85,27 @@ class Image(torch.nn.Module):
                 +        lerp_weights[:,0] *  (1 - lerp_weights[:,1]) *      lerp_weights[:,2] * c101
                 +        lerp_weights[:,0] *       lerp_weights[:,1] *       lerp_weights[:,2] * c111)
 
+# def calculate_PSNR(orginal_vol, compressed_vol, max_function_value):
+#     MSE = ((orginal_vol - compressed_vol) **2).mean()
+#     return 20 * torch.log10(max_function_value / torch.sqrt(MSE))
+sum_batch = 0
+def calculate_part_PSNR(orginal_vol, compressed_vol):
+    global sum_batch
+    temp = ((orginal_vol - compressed_vol) **2).sum()
+    sum_batch += temp
+    print(temp)
 
 if __name__ == "__main__":
+    # # test 3
+    # for i in range(1024):
+    #     print("i: ", i, end="")
+    #     org = read_volume("data/images/chameleon_1024x1024x1080_float32.raw", (1, 1024, 1080), np.float32, i * 4 * 1024 * 1080)
+    #     compre = read_volume("1000.raw", (1, 1024, 1080), np.float32, i * 4 * 1024 * 1080)
+    #     calculate_part_PSNR(org, compre)
+    # MSE = sum_batch / 1024*1024*1080
+    # print("PSNR:", 20 * torch.log10(1.0 / torch.sqrt(torch.tensor(MSE))))
+    
+    
     volume_oringin = read_volume("data/images/bonsai.raw", (256, 256, 256), np.uint8)
     volume_1000 = read_volume("1000.raw", (256, 256, 256), np.uint8)
     # print(volume_oringin.max())
