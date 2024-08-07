@@ -1,3 +1,4 @@
+import torch
 from torch import inf, Tensor
 from torch.optim import Optimizer
 from encoder import HashEmbedderNative
@@ -104,13 +105,18 @@ class loss_monitor:
         self._last_sz = self.encoder.get_log2_hashmap_size()
 
     def _incre_sz(self, epoch):
-        if self.encoder.get_log2_hashmap_size() < self.max_sz:
-            self.encoder.increase_embedding_size_by_two()
-            print("iter:", epoch, " encoder idx ", self.enc_idx, " increase hashmap size to 2^", self.encoder.get_log2_hashmap_size())
-            self.optimizer.add_param_group({"params": self.encoder.parameters()})
+        free_memory, total_memory = torch.cuda.mem_get_info()
+        required_memory = self.encoder.get_params_size() * 2
+        if free_memory > required_memory:
+            if self.encoder.get_log2_hashmap_size() < self.max_sz:
+                self.encoder.increase_embedding_size_by_two()
+                print("iter:", epoch, " encoder idx ", self.enc_idx, " increase hashmap size to 2^", self.encoder.get_log2_hashmap_size())
+                self.optimizer.add_param_group({"params": self.encoder.parameters()})
+            else:
+                print("iter:", epoch, " encoder idx ", self.enc_idx, " has already reached the max hashmap size 2^", self.max_sz)
         else:
-            print("iter:", epoch, " encoder idx ", self.enc_idx, " has already reached the max hashmap size 2^", self.max_sz)
-
+            print("iter:", epoch, " encoder idx ", self.enc_idx, " has no space to increase hashmap size. Free Space: ", free_memory / 1e9, 
+                  "GB, Required Space: ", required_memory / 1e9, " GB, Current Hashmap Size: ", self.encoder.get_log2_hashmap_size())
     @property
     def in_cooldown(self):
         return self.cooldown_counter > 0

@@ -72,6 +72,11 @@ class HashEmbedderNative(nn.Module):
         self.register_parameter("params", self.params)
         # initialize these parameters
         nn.init.uniform_(self.params, -1e-4 * scale, 1e-4 * scale)
+    
+    def get_params_size(self):
+        last_level_idx = len(self.embedding_offsets) - 1
+        # calculate the total number of parameters and multiply with the size of torch.float32 (4 bytes)
+        return (self.embedding_offsets[last_level_idx] + self.embedding_lengths[last_level_idx]) * self.n_features_per_level * 4
 
     def increase_embedding_size_by_two(self):
         new_log2_hashmap_size = self.log2_hashmap_size + 1
@@ -116,7 +121,7 @@ class HashEmbedderNative(nn.Module):
                 # expand hashed indices to access all elements in each feature vector
                 hashed_indices = torch.stack([hashed_indices + ith for ith in range(self.n_features_per_level)], dim=1)
                 hashed_indices = hashed_indices.view(-1)
-                hashed_indices = hashed_indices.to("xpu")
+                hashed_indices = hashed_indices.to("cuda")
                 # use indices to query the original hash table and store them as the new table
                 # must cast hashed_indices to int64 to avoid error (don't know why now)
                 # also need to pad new params if xyz.shape is not aligned with length
