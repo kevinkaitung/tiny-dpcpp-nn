@@ -12,9 +12,9 @@ def coherent_prime_hash(coords):
     '''
     primes = torch.tensor([1, 2654435761, 805459861, 3674653429, 2097192037, 1434869437, 2165219737])
 
-    xor_result = torch.zeros_like(coords[..., 0].to(torch.int32))
+    xor_result = torch.zeros_like(coords[..., 0].to(torch.int64))
     for i in range(coords.shape[-1]):
-        xor_result ^= coords[..., i].to(torch.int32) * primes[i]
+        xor_result ^= coords[..., i].to(torch.int64) * primes[i]
 
     return xor_result
 
@@ -257,9 +257,9 @@ class HashEmbedderNative(nn.Module):
         '''It is possible that the coordinate is larger than the domain size.'''
         HASH = coherent_prime_hash # TCNN provides multiple hash functions
         assert (indices.shape[-1] == 2 or indices.shape[-1] == 3)
-        resolution = np.uint32(resolution)
-        stride = np.uint32(1)
-        output = torch.zeros_like(indices[...,0])
+        resolution = np.uint64(resolution)
+        stride = np.uint64(1)
+        output = torch.zeros_like(indices[...,0], dtype=torch.int64)
         for dim in range(self.n_pos_dims):
             output += indices[...,dim] * stride
             stride *= resolution  # --> expecting integer overflow in scalar multiply

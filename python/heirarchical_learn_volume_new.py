@@ -88,7 +88,7 @@ def get_args():
         "n_steps",
         nargs="?",
         type=int,
-        default=1001,
+        default=100001,
         help="Number of training steps",
     )
     parser.add_argument(
@@ -164,7 +164,7 @@ def main():
     sampler = spl.create_sampler("structuredRegular", "openvkl", filename=args.filename, dims=args.dims, dtype=args.type, n_channels=n_channels)
 
     
-    test_partition_size = 2
+    test_partition_size = 1
     try_runs = 1
     file_name = 'records_of_partition_size_'+str(test_partition_size)+'(loss_monitor_ver).json'
     records = dict()
@@ -193,7 +193,10 @@ def main():
         json.dump(records, file, indent=4) 
 
 def train_volume(device_name, device, args, config, n_channels, sampler, partition_size):
+    track_loss = True
     calculate_PSNR = True
+    if track_loss:
+        writer = SummaryWriter()
     # partition_size = 2
     n_pos_dims = 3
     
@@ -208,7 +211,7 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
     network = MLP_Native(n_input_dims=encodings[0].n_output_dims, n_output_dims=n_channels, network_config=config["network"]).to(device)
     
     optimizer = torch.optim.Adam([{"params":encodings.parameters()}, {"params":network.parameters()}], lr=1e-3)
-    enc_loss_monitors = [loss_monitor(encoder=x, optimizer=optimizer, mode="min", factor=1, patience=60, threshold=1e-4,
+    enc_loss_monitors = [loss_monitor(encoder=x, optimizer=optimizer, mode="min", factor=1, patience=100060, threshold=1e-4,
                                         threshold_mode="rel", cooldown=0, max_sz=25, eps=1e-8, enc_idx=j, error_bound=error_bounds) for j, x in enumerate(encodings)]
     # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
     # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
@@ -284,7 +287,7 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
         # enc_optimizer.step()
         # net_optimizer.step()
 
-        if i % interval == 0 or i == (args.n_steps - 1):
+        if i % interval == 0 or i == (args.n_steps - 1) or i % 1000 == 0:
             loss_val = loss.item()
             # torch.xpu.synchronize()
             torch.cuda.synchronize()
@@ -328,7 +331,8 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
                 PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
                 PSNR_val = PSNR.item()
                 print("PSNR:", PSNR_val)
-                
+            else:
+                PSNR_val = 0.0    
 
             # Ignore the time spent saving the image
             prev_time = time.perf_counter()
@@ -356,6 +360,15 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
         #         # enc_optimizer.add_param_group({"params": encodings[max_loss_enc_idx].parameters()})
         #         # enc_optimizer = torch.optim.Adam(encodings.parameters(), lr=1e-3)
         #         # net_optimizer = torch.optim.Adam(network.parameters(), lr=1e-3)
+        
+        
+        # track losses with tensorboard
+        if track_loss:
+            losses_for_tensorboard = dict()
+            for j in range(loss_of_encoders.shape[0]):
+                losses_for_tensorboard["encoder_" + str(j)] = loss_of_encoders[j]
+            losses_for_tensorboard["average"] = loss
+            writer.add_scalars("Loss/train", losses_for_tensorboard, i)
     
     # calculate model size
     param_size = 0
@@ -377,6 +390,10 @@ def train_volume(device_name, device, args, config, n_channels, sampler, partiti
     print("hashmap sz of encoders at final iteration:")
     hashmap_sz_of_encoders = [x.get_log2_hashmap_size() for x in encodings]
     print(hashmap_sz_of_encoders)
+    
+    if track_loss:
+        writer.flush()
+        writer.close()
     
     return loss_val, PSNR_val, size_all_mb, hashmap_sz_of_encoders
 
