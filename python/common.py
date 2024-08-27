@@ -197,8 +197,9 @@ def read_volume(file, shape, dtype, offset=0):
         f.seek(offset * np.dtype(dtype).itemsize)
         # only read the chunk of the data assigned by the shape
         volume = np.frombuffer(f.read(shape[0] * shape[1] * shape[2] * np.dtype(dtype).itemsize), dtype=dtype)
-        # cast volume data into float32 and reshape
-        volume = volume.astype(np.float32).reshape(shape)
+        # cast volume data into float32 and
+        # reshape it with [z-dim, y-dim, x-dim] because raw data stores elements along x-dim first
+        volume = volume.astype(np.float32).reshape([shape[i] for i in [2,1,0]])
     return volume
    
 def write_volume(file, volume, dtype=np.uint8, offset=0):
