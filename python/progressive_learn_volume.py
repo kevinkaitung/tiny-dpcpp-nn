@@ -108,11 +108,30 @@ def get_args():
 def accumulate_squared_errors_of_slice(diff_targets_output):
     return ((diff_targets_output) ** 2).sum()
 
-def calculate_PSNR_from_squared_errors_sum(squared_errors_sum, resolution):
+def calculate_PSNR_from_squared_errors_sum(squared_errors_sum, resolution, max_value):
+    # max value = 2 if value range is -1 ~ 1
+    # max_value = 2.0
     temp = squared_errors_sum / (resolution[0] * resolution[1] * resolution[2])
-    return 20 * torch.log10(1.0 / torch.sqrt(torch.tensor(temp)))
+    return 20 * torch.log10(max_value / torch.sqrt(torch.tensor(temp)))
 
-def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name, datatype, old_diff_max, old_diff_min):
+sampler_max = 1.0
+sampler_min = 0.0
+
+def normalize_to_neg_one_and_one(data, original_max, original_min):
+    original_range = original_max - original_min
+    normalized_max = 1.0
+    normalized_min = -1.0
+    normalized_range = normalized_max - normalized_min
+    return ((data - original_min) / original_range) * normalized_range + normalized_min
+
+def denormalize_from_neg_one_and_one(data, original_max, original_min):
+    original_range = original_max - original_min
+    normalized_max = 1.0
+    normalized_min = -1.0
+    normalized_range = normalized_max - normalized_min
+    return ((data - normalized_min) / normalized_range) * original_range + original_min
+
+def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name, datatype, old_diff_max, old_diff_min, prog_iter):
     squared_errors_sum = 0
     track_max = -10
     track_min = 10
@@ -144,6 +163,9 @@ def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name
                 chunk = chunk.to(device_name)
                 # targets and output are normalized now
                 targets = targets.to(device_name)
+                if prog_iter > 0:
+                    # normalize targets from 0~1 to -1~1
+                    targets = normalize_to_neg_one_and_one(targets, sampler_max, sampler_min)
                 
                 # output = model(chunk).clamp(0.0, 1.0)
                 output = model(chunk)
@@ -156,9 +178,11 @@ def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name
                 diff_targets_output = targets - output
                 squared_errors_sum += accumulate_squared_errors_of_slice(diff_targets_output=diff_targets_output)
                 
-                # denormalized output and targets
-                output = output * (old_diff_max - old_diff_min) + old_diff_min
-                targets = targets * (old_diff_max - old_diff_min) + old_diff_min
+                if prog_iter == 0:
+                    output = normalize_to_neg_one_and_one(output, 1.0, 0.0)
+                else:
+                    # denormalized output and targets from -1~1 to original value range
+                    output = denormalize_from_neg_one_and_one(output, old_diff_max, old_diff_min)
                 
                 write_volume(
                     path_name, 
@@ -172,7 +196,11 @@ def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name
                     # calculate offset by the number of elements in xy plane and chunk offset
                     offset= z * resolution[0] * resolution[1] + chunk_idx * chunk_size 
                 )
-    PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution)
+    if prog_iter == 0:
+        max_value = 1.0
+    else:
+        max_value = 2.0
+    PSNR = calculate_PSNR_from_squared_errors_sum(squared_errors_sum=squared_errors_sum, resolution=resolution, max_value=max_value) # max value = 1 - (-1)
     PSNR_val = PSNR.item()
     print("PSNR:", PSNR_val)
     # import pdb; pdb.set_trace()
@@ -215,37 +243,46 @@ def train_volume_progressively(device_name, device, args):
     
     # use tiny-cuda-nn's model
     encodings = [tcnn.Encoding(n_pos_dims, config["encoding"]) for _ in range(progressive_iter)]
-    networks = [tcnn.Network(encodings[0].n_output_dims, n_channels, config["network"]) for _ in range(progressive_iter)]
+    
+    networks = []
+    for i in range(progressive_iter):
+        current_config = config["network"].copy()
+        if i == 0:
+            current_config["activation"] = "ReLU"
+        networks.append(tcnn.Network(encodings[0].n_output_dims, n_channels, current_config))
     
     models = nn.ModuleList([torch.nn.Sequential(encodings[i], networks[i]).to(device) for i in range(progressive_iter)])
     optimizers = [torch.optim.Adam([{"params":models[i].parameters()}], lr=1e-3) for i in range(progressive_iter)]
     # optimizer = torch.optim.Adam([{"params":models.parameters()}], lr=1e-3)
     
     # volume queried from sampler would be normalized to 0~1
+    # but will intentionally normalize to -1~1 when querying sampler
     volume_max = 1.0
-    volume_min = 0.0
+    volume_min = -1.0
     sampler = spl.create_sampler("structuredRegular", "openvkl", filename=args.filename, dims=args.dims, dtype=args.type, n_channels=n_channels)
     
     # just for convenience not to create grid again to query values in sampler
     # actually, no need to read original dataset and normalize it again
     # unnormalized form
     original_volume = read_volume(file=args.filename, shape=args.dims, dtype=args.type)
-    original_volume_max = original_volume.max()
-    original_volume_min = original_volume.min()
-    # normalize original volume (0~1)
-    original_volume = (original_volume - original_volume_min) / (original_volume_max - original_volume_min) * 1.0
+    # normalize to -1~1
+    original_volume = normalize_to_neg_one_and_one(original_volume, original_volume.max(), original_volume.min())
+    # original_volume_max = original_volume.max()
+    # original_volume_min = original_volume.min()
+    # # normalize original volume (0~1)
+    # original_volume = (original_volume - original_volume_min) / (original_volume_max - original_volume_min) * 1.0
     
     losses_all_progressive_iters = []
     for i in range(progressive_iter):
         losses = train_volume_one_time(device_name=device_name, device=device, resolution=resolution, training_steps=training_steps,
-                              sampler=sampler, model=models[i], optimizer=optimizers[i])
+                              sampler=sampler, model=models[i], optimizer=optimizers[i], prog_iter=i)
         losses_all_progressive_iters.append(losses)
         
         path_name = "volume_progress_" + str(i) + "_decompressed.bin"
         # write volume
         onePSNR = decode_and_calculate_PSNR(device_name=device_name, resolution=resolution,
                                   sampler=sampler, model=models[i], path_name=path_name, datatype=np.float32, 
-                                  old_diff_max=volume_max, old_diff_min=volume_min)
+                                  old_diff_max=volume_max, old_diff_min=volume_min, prog_iter=i)
         if i == 0:
             tmp = read_volume(file=path_name, shape=args.dims, dtype="float32")
             accumulate_volume = tmp
@@ -277,7 +314,7 @@ def train_volume_progressively(device_name, device, args):
         writer.close()
     
     
-def train_volume_one_time(device_name, device, resolution, training_steps, sampler, model, optimizer):
+def train_volume_one_time(device_name, device, resolution, training_steps, sampler, model, optimizer, prog_iter):
             
     prev_time = time.perf_counter()
 
@@ -293,6 +330,9 @@ def train_volume_one_time(device_name, device, resolution, training_steps, sampl
         coords, targets = spl.sample(sampler, batch_size)
         coords = coords.to(device_name)
         targets = targets.to(device_name)
+        if prog_iter > 0:
+            # normalize targets from 0~1 to -1~1
+            targets = normalize_to_neg_one_and_one(targets, sampler_max, sampler_min)
         
         # version complying with the coordinates generated by dvnr sampler
         output = model(coords)

@@ -7,16 +7,26 @@ def accumulate_squared_errors_of_slice(diff_targets_output):
     return ((diff_targets_output) ** 2).sum()
 
 def calculate_PSNR_from_squared_errors_sum(squared_errors_sum, resolution):
+    # max value = 2 if value range is -1 ~ 1
+    max_value = 2.0
     temp = squared_errors_sum / (resolution[0] * resolution[1] * resolution[2])
-    return 20 * torch.log10(1.0 / torch.sqrt(torch.tensor(temp)))
+    return 20 * torch.log10(max_value / torch.sqrt(torch.tensor(temp)))
+
+def normalize_to_neg_one_and_one(data, original_max, original_min):
+    original_range = original_max - original_min
+    normalized_max = 1.0
+    normalized_min = -1.0
+    normalized_range = normalized_max - normalized_min
+    return ((data - original_min) / original_range) * normalized_range + normalized_min
 
 def main():
     resolution = [1152, 320, 853]
     original_volume = read_volume("data/images/1atm.H2O.3x.1152.320.853f32.bin", resolution, np.float32)
-    original_volume_max = original_volume.max()
-    original_volume_min = original_volume.min()
-    # normalize original volume
-    original_volume = (original_volume - original_volume_min) / (original_volume_max - original_volume_min) * 1.0
+    original_volume = normalize_to_neg_one_and_one(original_volume, original_volume.max(), original_volume.min())
+    # original_volume_max = original_volume.max()
+    # original_volume_min = original_volume.min()
+    # # normalize original volume
+    # original_volume = (original_volume - original_volume_min) / (original_volume_max - original_volume_min) * 1.0
     
     progressive_iter = 8
     for i in range(progressive_iter):
@@ -26,8 +36,10 @@ def main():
         # import pdb; pdb.set_trace()
         if i > 0:
             # normalize vol_decompressed and vol_residual for calculating PSNR and loss
-            vol_decompressed = (vol_decompressed - vol_residual.min()) / (vol_residual.max() - vol_residual.min())
-            vol_residual = (vol_residual - vol_residual.min()) / (vol_residual.max() - vol_residual.min())
+            # vol_decompressed = (vol_decompressed - vol_residual.min()) / (vol_residual.max() - vol_residual.min())
+            # vol_residual = (vol_residual - vol_residual.min()) / (vol_residual.max() - vol_residual.min())
+            vol_decompressed = normalize_to_neg_one_and_one(vol_decompressed, vol_residual.max(), vol_residual.min())
+            vol_residual = normalize_to_neg_one_and_one(vol_residual, vol_residual.max(), vol_residual.min())
             print("residual (ground truth) max and min value: ", vol_residual.max(), " ", vol_residual.min())
             print("trained model's inference output max and min value:", vol_decompressed.max(), " ", vol_decompressed.min())
             PSNR = calculate_PSNR_from_squared_errors_sum(
