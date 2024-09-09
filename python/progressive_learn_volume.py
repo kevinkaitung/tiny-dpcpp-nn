@@ -40,6 +40,7 @@ from torch.func import stack_module_state, functional_call
 from torch import vmap
 from torch.utils.tensorboard import SummaryWriter
 import copy
+import subprocess
 
 from common import read_image, write_image, ROOT_DIR, read_volume, write_volume
 from encoder import HashEmbedderNative
@@ -236,6 +237,7 @@ def train_volume_progressively(device_name, device, args):
         writer = SummaryWriter()
     
     progressive_iter = 8
+    neural_network_iter = 4
     
     # use our own pytorch model
     # encodings = [HashEmbedderNative(n_pos_dims=n_pos_dims, encoding_config=config["encoding"]) for _ in range(progressive_iter)]
@@ -272,22 +274,35 @@ def train_volume_progressively(device_name, device, args):
     # # normalize original volume (0~1)
     # original_volume = (original_volume - original_volume_min) / (original_volume_max - original_volume_min) * 1.0
     
+    # directly reading volume from file doesn't have normalization to -1~1
+    residual_path_name = args.filename
+    
     losses_all_progressive_iters = []
     for i in range(progressive_iter):
-        losses = train_volume_one_time(device_name=device_name, device=device, resolution=resolution, training_steps=training_steps,
-                              sampler=sampler, model=models[i], optimizer=optimizers[i], prog_iter=i)
-        losses_all_progressive_iters.append(losses)
+        print("Progressive iteration: ", i)
+        decomp_path_name = "volume_progress_" + str(i) + "_decompressed.bin"
         
-        path_name = "volume_progress_" + str(i) + "_decompressed.bin"
-        # write volume
-        onePSNR = decode_and_calculate_PSNR(device_name=device_name, resolution=resolution,
-                                  sampler=sampler, model=models[i], path_name=path_name, datatype=np.float32, 
-                                  old_diff_max=volume_max, old_diff_min=volume_min, prog_iter=i)
+        # use neural network for early iterations
+        if i < neural_network_iter:
+            losses = train_volume_one_time(device_name=device_name, device=device, resolution=resolution, training_steps=training_steps,
+                                sampler=sampler, model=models[i], optimizer=optimizers[i], prog_iter=i)
+            losses_all_progressive_iters.append(losses)
+            # write volume
+            onePSNR = decode_and_calculate_PSNR(device_name=device_name, resolution=resolution,
+                                    sampler=sampler, model=models[i], path_name=decomp_path_name, datatype=np.float32, 
+                                    old_diff_max=volume_max, old_diff_min=volume_min, prog_iter=i)
+        # use sperr for later iterations
+        # be careful of value range
+        else:
+            temp_path = "temp_compr_output.bit"
+            train_volume_with_SPERR(float_type=32, resolution=resolution, output_path=temp_path, target_PSNR=35, input_path=residual_path_name)
+            decode_volume_with_SPERR(output_path=decomp_path_name, input_path=temp_path)
+        
         if i == 0:
-            tmp = read_volume(file=path_name, shape=args.dims, dtype="float32")
+            tmp = read_volume(file=decomp_path_name, shape=args.dims, dtype="float32")
             accumulate_volume = tmp
         else:
-            tmp = read_volume(file=path_name, shape=args.dims, dtype="float32")
+            tmp = read_volume(file=decomp_path_name, shape=args.dims, dtype="float32")
             accumulate_volume += tmp
         # accumulate_volume = accumulate_volume.clip(0.0, 1.0)
         residual_volume = (original_volume - accumulate_volume)
@@ -296,10 +311,11 @@ def train_volume_progressively(device_name, device, args):
         # and store as binary file
         volume_max = residual_volume.max()
         volume_min = residual_volume.min()
-        write_volume(file="volume_progress_"+str(i)+"_residual.bin", volume=residual_volume, dtype="float32")
+        residual_path_name = "volume_progress_"+str(i)+"_residual.bin"
+        write_volume(file=residual_path_name, volume=residual_volume, dtype="float32")
         
         # update sampler
-        sampler = spl.create_sampler("structuredRegular", "openvkl", filename="volume_progress_"+str(i)+"_residual.bin",
+        sampler = spl.create_sampler("structuredRegular", "openvkl", filename=residual_path_name,
                                      dims=args.dims, dtype="float32", n_channels=n_channels)
     
     # track losses with tensorboard
@@ -365,6 +381,28 @@ def train_volume_one_time(device_name, device, resolution, training_steps, sampl
     
     # print("==================================================")
     return losses
+
+def train_volume_with_SPERR(float_type, resolution, output_path, target_PSNR, input_path):
+    
+    try:
+        result = subprocess.run(["/home/kctung/Projects/SPERR/build/bin/sperr3d", "-c", "--ftype", str(float_type),
+                        "--dims", str(resolution[0]), str(resolution[1]), str(resolution[2]), "--bitstream", output_path,
+                        "--print_stats", "--psnr", str(target_PSNR), input_path
+                        ], capture_output=True, text=True, check=True)
+        print("SPERR result:", result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
+
+def decode_volume_with_SPERR(output_path, input_path):
+    
+    try:
+        result = subprocess.run(["/home/kctung/Projects/SPERR/build/bin/sperr3d", "-d",
+                        "--decomp_f", output_path, input_path
+                        ], capture_output=True, text=True, check=True)
+        print("SPERR result:", result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
+    
 
 if __name__ == "__main__":
     main()
