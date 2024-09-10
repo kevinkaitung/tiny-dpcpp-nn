@@ -132,7 +132,7 @@ def denormalize_from_neg_one_and_one(data, original_max, original_min):
     normalized_range = normalized_max - normalized_min
     return ((data - normalized_min) / normalized_range) * original_range + original_min
 
-def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name, datatype, old_diff_max, old_diff_min, prog_iter):
+def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name, datatype, old_diff_max, old_diff_min, prog_iter, neu_iter, mapping_type, mapping_size, gauss_scale):
     squared_errors_sum = 0
     track_max = -10
     track_min = 10
@@ -169,6 +169,9 @@ def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name
                     targets = normalize_to_neg_one_and_one(targets, sampler_max, sampler_min)
                 
                 # output = model(chunk).clamp(0.0, 1.0)
+                if prog_iter >= neu_iter:
+                    chunk = input_mapping(chunk, generate_B_for_fourier_feature_mapping(device_name=device_name, mapping_type=mapping_type, mapping_size=mapping_size, n_pos_dims=len(resolution), gauss_scale=gauss_scale))
+        
                 output = model(chunk)
                 
                 # for checking the max and min output values from the model
@@ -206,7 +209,24 @@ def decode_and_calculate_PSNR(device_name, resolution, sampler, model, path_name
     print("PSNR:", PSNR_val)
     # import pdb; pdb.set_trace()
     return PSNR_val
+
+def input_mapping(x, B):
+    if B is None:
+        return x
+    else:
+        x_proj = (2.0 * torch.pi * x) @ B.transpose(0, 1)
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
     
+def generate_B_for_fourier_feature_mapping(device_name, mapping_type, mapping_size, n_pos_dims, gauss_scale):
+    if mapping_type == "none":
+        B = None
+    elif mapping_type == "basic":
+        B = torch.eye(n_pos_dims).to(device_name)
+    elif mapping_type == "gauss":
+        B = torch.randn(mapping_size, n_pos_dims).to(device_name)
+        B = B * gauss_scale
+    return B
+
 def main():
     print("================================================================")
     print("This script replicates the behavior of the native SYCL example  ")
@@ -237,23 +257,40 @@ def train_volume_progressively(device_name, device, args):
         writer = SummaryWriter()
     
     progressive_iter = 8
-    neural_network_iter = 4
+    neural_network_iter = 1
+    fourier_feature_mapping_size = 128
+    mapping_type = "gauss"
+    gauss_scale = 100.0
     
     # use our own pytorch model
     # encodings = [HashEmbedderNative(n_pos_dims=n_pos_dims, encoding_config=config["encoding"]) for _ in range(progressive_iter)]
     # networks = [MLP_Native(n_input_dims=encodings[0].n_output_dims, n_output_dims=n_channels, network_config=config["network"]) for _ in range(progressive_iter)]
     
     # use tiny-cuda-nn's model
-    encodings = [tcnn.Encoding(n_pos_dims, config["encoding"]) for _ in range(progressive_iter)]
+    encodings = [tcnn.Encoding(n_pos_dims, config["encoding"]) for _ in range(neural_network_iter)]
     
     networks = []
     for i in range(progressive_iter):
         current_config = config["network"].copy()
-        if i == 0:
-            current_config["activation"] = "ReLU"
-        networks.append(tcnn.Network(encodings[0].n_output_dims, n_channels, current_config))
+        if i < neural_network_iter:
+            if i == 0:
+                current_config["activation"] = "ReLU"
+            network_in = encodings[0].n_output_dims
+        else:
+            # multiply with 2 for sin and cos
+            current_config["activation"] = "Sine"
+            current_config["output_activation"] = "None"
+            current_config["n_neurons"] = 256
+            current_config["n_hidden_layers"] = 4
+            network_in = fourier_feature_mapping_size * 2
+        networks.append(tcnn.Network(network_in, n_channels, current_config))
     
-    models = nn.ModuleList([torch.nn.Sequential(encodings[i], networks[i]).to(device) for i in range(progressive_iter)])
+    models = [torch.nn.Sequential(encodings[i], networks[i]).to(device) for i in range(neural_network_iter)]
+    # append rest models for later iterations which use fourier features
+    for i in range(neural_network_iter, progressive_iter):
+        models.append(networks[i])
+        
+    models = nn.ModuleList(models)
     optimizers = [torch.optim.Adam([{"params":models[i].parameters()}], lr=1e-3) for i in range(progressive_iter)]
     # optimizer = torch.optim.Adam([{"params":models.parameters()}], lr=1e-3)
     
@@ -282,21 +319,21 @@ def train_volume_progressively(device_name, device, args):
         print("Progressive iteration: ", i)
         decomp_path_name = "volume_progress_" + str(i) + "_decompressed.bin"
         
-        # use neural network for early iterations
-        if i < neural_network_iter:
-            losses = train_volume_one_time(device_name=device_name, device=device, resolution=resolution, training_steps=training_steps,
-                                sampler=sampler, model=models[i], optimizer=optimizers[i], prog_iter=i)
-            losses_all_progressive_iters.append(losses)
-            # write volume
-            onePSNR = decode_and_calculate_PSNR(device_name=device_name, resolution=resolution,
-                                    sampler=sampler, model=models[i], path_name=decomp_path_name, datatype=np.float32, 
-                                    old_diff_max=volume_max, old_diff_min=volume_min, prog_iter=i)
-        # use sperr for later iterations
-        # be careful of value range
-        else:
-            temp_path = "temp_compr_output.bit"
-            train_volume_with_SPERR(float_type=32, resolution=resolution, output_path=temp_path, target_PSNR=35, input_path=residual_path_name)
-            decode_volume_with_SPERR(output_path=decomp_path_name, input_path=temp_path)
+        # # use neural network for early iterations
+        # if i < neural_network_iter:
+        losses = train_volume_one_time(device_name=device_name, device=device, resolution=resolution, training_steps=training_steps,
+                            sampler=sampler, model=models[i], optimizer=optimizers[i], prog_iter=i, neu_iter=neural_network_iter, mapping_type=mapping_type, mapping_size=fourier_feature_mapping_size, gauss_scale=gauss_scale)
+        losses_all_progressive_iters.append(losses)
+        # write volume
+        onePSNR = decode_and_calculate_PSNR(device_name=device_name, resolution=resolution,
+                                sampler=sampler, model=models[i], path_name=decomp_path_name, datatype=np.float32, 
+                                old_diff_max=volume_max, old_diff_min=volume_min, prog_iter=i, neu_iter=neural_network_iter, mapping_type=mapping_type, mapping_size=fourier_feature_mapping_size, gauss_scale=gauss_scale)
+        # # use sperr for later iterations
+        # # be careful of value range
+        # else:
+        #     temp_path = "temp_compr_output.bit"
+        #     train_volume_with_SPERR(float_type=32, resolution=resolution, output_path=temp_path, target_PSNR=35, input_path=residual_path_name)
+        #     decode_volume_with_SPERR(output_path=decomp_path_name, input_path=temp_path)
         
         if i == 0:
             tmp = read_volume(file=decomp_path_name, shape=args.dims, dtype="float32")
@@ -330,7 +367,7 @@ def train_volume_progressively(device_name, device, args):
         writer.close()
     
     
-def train_volume_one_time(device_name, device, resolution, training_steps, sampler, model, optimizer, prog_iter):
+def train_volume_one_time(device_name, device, resolution, training_steps, sampler, model, optimizer, prog_iter, neu_iter, mapping_type, mapping_size, gauss_scale):
             
     prev_time = time.perf_counter()
 
@@ -350,6 +387,8 @@ def train_volume_one_time(device_name, device, resolution, training_steps, sampl
             # normalize targets from 0~1 to -1~1
             targets = normalize_to_neg_one_and_one(targets, sampler_max, sampler_min)
         
+        if prog_iter >= neu_iter:
+            coords = input_mapping(coords, generate_B_for_fourier_feature_mapping(device_name=device_name, mapping_type=mapping_type, mapping_size=mapping_size, n_pos_dims=len(resolution), gauss_scale=gauss_scale))
         # version complying with the coordinates generated by dvnr sampler
         output = model(coords)
         # adjust the output size to align with the target size
